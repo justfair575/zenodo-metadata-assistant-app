@@ -320,27 +320,59 @@ class ExtractedMetadata(BaseModel):
     )
 
     @field_validator(
+        "machine_learning_task",
+        mode="before",
+    )
+    @classmethod
+    def normalize_machine_learning_task(cls, data):
+        """Normaliza a tarefa para uma lista.
+
+        A IA pode sugerir zero ou uma tarefa.
+        O utilizador pode posteriormente selecionar várias.
+        """
+
+        if isinstance(data, str):
+            return {
+                "value": [data],
+                "suggested_value": [data],
+                "status": "suggested",
+            }
+
+        if isinstance(data, dict):
+            normalized = dict(data)
+
+            for key in ("value", "suggested_value"):
+                current = normalized.get(key)
+
+                if isinstance(current, str):
+                    normalized[key] = [current]
+
+                elif current is None:
+                    normalized[key] = []
+
+            return normalized
+
+        return data
+
+    @field_validator(
         "creators",
         mode="before",
     )
     @classmethod
     def normalize_creator_collection(cls, data):
+        """Compatibilidade com respostas antigas do Ollama."""
 
-        # Compatibilidade com respostas antigas do Ollama.
         if isinstance(data, dict):
-
             normalized = dict(data)
 
             for key in (
                     "value",
                     "suggested_value",
             ):
-
                 if isinstance(
                         normalized.get(key),
                         str,
                 ):
-
                     normalized[key] = [
                         normalized[key]
                     ]
@@ -348,7 +380,6 @@ class ExtractedMetadata(BaseModel):
             return normalized
 
         if isinstance(data, str):
-
             return {
                 "value": [data],
                 "suggested_value": [data],
@@ -371,7 +402,6 @@ class ExtractedMetadata(BaseModel):
                 "value",
                 "suggested_value",
         ):
-
             raw_creators = getattr(
                 field,
                 attribute,
@@ -430,7 +460,6 @@ class ExtractedMetadata(BaseModel):
                 creators,
                 start=1,
         ):
-
             if not isinstance(
                     creator,
                     CreatorIdentity,
@@ -440,7 +469,6 @@ class ExtractedMetadata(BaseModel):
                 )
 
             if creator.creator_type == "person":
-
                 if not creator.orcid_id:
                     raise ValueError(
                         f"O criador {index} é uma pessoa "
@@ -448,7 +476,6 @@ class ExtractedMetadata(BaseModel):
                     )
 
             elif creator.creator_type == "organization":
-
                 if not creator.ror_id:
                     raise ValueError(
                         f"O criador {index} é uma organização "

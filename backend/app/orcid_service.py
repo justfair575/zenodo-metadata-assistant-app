@@ -1,9 +1,10 @@
-"""Serviços OAuth para autenticar criadores através da ORCID.
 
-Esta primeira implementação destina-se ao desenvolvimento local com FastAPI
-num único processo. O estado OAuth e os tokens ficam apenas em memória.
-Para produção/múltiplos workers, devem ser substituídos por armazenamento
-partilhado e persistente, associado a uma sessão de utilizador.
+"""Serviços OAuth ORCID para desenvolvimento local com FastAPI.
+
+O estado OAuth, os tokens e as sessões ficam em memória.
+
+Esta implementação é adequada a um único processo de desenvolvimento.
+Em produção deve usar-se armazenamento partilhado e persistente.
 """
 
 from __future__ import annotations
@@ -11,44 +12,63 @@ from __future__ import annotations
 import os
 import secrets
 import time
+
 from typing import Any
 from urllib.parse import urlencode, urlsplit
 
 import httpx
 
-from app.metadata_schema import is_valid_orcid, normalize_orcid
+from app.metadata_schema import (
+    is_valid_orcid,
+    normalize_orcid,
+)
 
 
-# ============================================================
-# CONFIGURAÇÃO
-# ============================================================
+ORCID_CLIENT_ID = os.getenv(
+    "ORCID_CLIENT_ID",
+    "",
+).strip()
 
-ORCID_CLIENT_ID = os.getenv("ORCID_CLIENT_ID", "").strip()
-ORCID_CLIENT_SECRET = os.getenv("ORCID_CLIENT_SECRET", "").strip()
+ORCID_CLIENT_SECRET = os.getenv(
+    "ORCID_CLIENT_SECRET",
+    "",
+).strip()
 
 ORCID_API_BASE_URL = os.getenv(
     "ORCID_API_BASE_URL",
     "https://sandbox.orcid.org",
 ).strip().rstrip("/")
 
-ORCID_REDIRECT_URI = os.getenv("ORCID_REDIRECT_URI", "").strip()
+ORCID_REDIRECT_URI = os.getenv(
+    "ORCID_REDIRECT_URI",
+    "",
+).strip()
+
 
 ORCID_STATE_TTL_SECONDS = 600
-ORCID_CREATOR_SESSION_TTL_SECONDS = 8 * 60 * 60
+
+ORCID_CREATOR_SESSION_TTL_SECONDS = (
+        8 * 60 * 60
+)
+
 
 _ALLOWED_ORCID_BASE_URLS = {
     "https://sandbox.orcid.org",
     "https://orcid.org",
 }
 
-# state -> timestamp de expiração (Unix time).
+
 _PENDING_ORCID_STATES: dict[str, float] = {}
 
-# ORCID iD -> token OAuth. Nunca é devolvido ao frontend.
-_AUTHENTICATED_ORCID_TOKENS: dict[str, dict[str, Any]] = {}
+_AUTHENTICATED_ORCID_TOKENS: dict[
+    str,
+    dict[str, Any],
+] = {}
 
-# Token opaco da aplicação -> identidade ORCID autenticada.
-_AUTHENTICATED_CREATOR_SESSIONS: dict[str, dict[str, Any]] = {}
+_AUTHENTICATED_CREATOR_SESSIONS: dict[
+    str,
+    dict[str, Any],
+] = {}
 
 
 # ============================================================
@@ -56,7 +76,6 @@ _AUTHENTICATED_CREATOR_SESSIONS: dict[str, dict[str, Any]] = {}
 # ============================================================
 
 def _validate_configuration() -> None:
-    """Valida a configuração antes de iniciar um fluxo OAuth."""
 
     missing = []
 
@@ -76,24 +95,38 @@ def _validate_configuration() -> None:
         )
 
     if ORCID_API_BASE_URL not in _ALLOWED_ORCID_BASE_URLS:
+
         raise RuntimeError(
             "ORCID_API_BASE_URL deve ser "
-            "https://sandbox.orcid.org ou https://orcid.org."
+            "https://sandbox.orcid.org ou "
+            "https://orcid.org."
         )
 
     parsed = urlsplit(ORCID_REDIRECT_URI)
 
+    is_local_http = (
+            parsed.scheme == "http"
+            and parsed.hostname in {
+                "localhost",
+                "127.0.0.1",
+            }
+    )
+
+    is_https = parsed.scheme == "https"
+
     if (
-            parsed.scheme != "https"
+            not (is_https or is_local_http)
             or not parsed.netloc
             or parsed.username is not None
             or parsed.password is not None
             or parsed.query
             or parsed.fragment
     ):
+
         raise RuntimeError(
-            "ORCID_REDIRECT_URI deve ser um URL HTTPS completo, "
-            "sem credenciais, query string ou fragmento."
+            "ORCID_REDIRECT_URI tem de ser HTTPS. "
+            "Em desenvolvimento local também é permitido "
+            "HTTP apenas para localhost/127.0.0.1."
         )
 
 
@@ -102,20 +135,20 @@ def _validate_configuration() -> None:
 # ============================================================
 
 def create_orcid_authorization_url() -> str:
-    """Cria um state anti-CSRF e devolve o URL de autorização ORCID."""
 
     _validate_configuration()
 
     now = time.time()
 
-    expired_states = [
-        key
-        for key, expires_at in _PENDING_ORCID_STATES.items()
-        if expires_at <= now
-    ]
+    for key, expires_at in list(
+            _PENDING_ORCID_STATES.items()
+    ):
 
-    for key in expired_states:
-        _PENDING_ORCID_STATES.pop(key, None)
+        if expires_at <= now:
+            _PENDING_ORCID_STATES.pop(
+                key,
+                None,
+            )
 
     state = secrets.token_urlsafe(32)
 
@@ -142,7 +175,6 @@ def create_orcid_authorization_url() -> str:
 # ============================================================
 
 def consume_orcid_state(state: str) -> bool:
-    """Consome o state uma única vez e confirma que não expirou."""
 
     expires_at = _PENDING_ORCID_STATES.pop(
         state,
@@ -156,7 +188,138 @@ def consume_orcid_state(state: str) -> bool:
 
 
 # ============================================================
-# TROCAR CÓDIGO POR TOKEN
+# NORMALIZAR NOME
+# ============================================================
+
+def _clean_name(value: Any) -> str | None:
+
+    if not isinstance(value, str):
+        return None
+
+    value = " ".join(value.split()).strip()
+
+    return value or None
+
+
+def _name_from_person_record(
+        person: dict[str, Any],
+) -> str | None:
+
+    name_data = person.get("name") or {}
+
+    credit_name = (
+            name_data.get("credit-name") or {}
+    ).get("value")
+
+    if _clean_name(credit_name):
+        return _clean_name(credit_name)
+
+    given = (
+            name_data.get("given-names") or {}
+    ).get("value")
+
+    family = (
+            name_data.get("family-name") or {}
+    ).get("value")
+
+    full_name = " ".join(
+        part
+        for part in (given, family)
+        if isinstance(part, str) and part.strip()
+    )
+
+    return _clean_name(full_name)
+
+
+# ============================================================
+# OBTER NOME ORCID
+# ============================================================
+
+async def _resolve_orcid_name(
+        client: httpx.AsyncClient,
+        token_data: dict[str, Any],
+        orcid_id: str,
+) -> str | None:
+
+    # Primeiro, utilizar o nome devolvido pelo OAuth.
+    name = _clean_name(
+        token_data.get("name")
+    )
+
+    if name:
+        return name
+
+    # Fallback: tentar obter o nome público do registo ORCID.
+    try:
+
+        response = await client.get(
+            f"{ORCID_API_BASE_URL}/v3.0/{orcid_id}/person",
+            headers={
+                "Accept": "application/json",
+                "Authorization": (
+                    f"Bearer {token_data['access_token']}"
+                ),
+            },
+        )
+
+        if response.is_success:
+            return _name_from_person_record(
+                response.json()
+            )
+
+    except (
+            httpx.HTTPError,
+            ValueError,
+            KeyError,
+    ):
+        pass
+
+    return None
+
+
+# ============================================================
+# LIMPAR SESSÕES EXPIRADAS
+# ============================================================
+
+def _cleanup_expired_creator_sessions() -> None:
+
+    now = time.time()
+
+    for token, session in list(
+            _AUTHENTICATED_CREATOR_SESSIONS.items()
+    ):
+
+        if session.get("expires_at", 0) <= now:
+
+            _AUTHENTICATED_CREATOR_SESSIONS.pop(
+                token,
+                None,
+            )
+
+
+def _cleanup_expired_orcid_tokens() -> None:
+
+    now = time.time()
+
+    for orcid_id, token_data in list(
+            _AUTHENTICATED_ORCID_TOKENS.items()
+    ):
+
+        expires_at = token_data.get("expires_at")
+
+        if (
+                expires_at is not None
+                and expires_at <= now
+        ):
+
+            _AUTHENTICATED_ORCID_TOKENS.pop(
+                orcid_id,
+                None,
+            )
+
+
+# ============================================================
+# TROCAR CÓDIGO POR TOKEN E IDENTIDADE
 # ============================================================
 
 async def exchange_orcid_authorization_code(
@@ -164,14 +327,14 @@ async def exchange_orcid_authorization_code(
         code: str,
         state: str,
 ) -> dict[str, Any]:
-    """Valida state e troca o código OAuth por identidade/token ORCID."""
 
     _validate_configuration()
 
     if not consume_orcid_state(state):
+
         raise ValueError(
-            "O state ORCID é inválido, já foi utilizado ou expirou. "
-            "Inicia novamente a autenticação."
+            "O state ORCID é inválido, já foi utilizado "
+            "ou expirou. Inicia novamente a autenticação."
         )
 
     token_url = (
@@ -192,6 +355,7 @@ async def exchange_orcid_authorization_code(
     }
 
     try:
+
         async with httpx.AsyncClient(
                 timeout=httpx.Timeout(
                     20.0,
@@ -210,64 +374,84 @@ async def exchange_orcid_authorization_code(
 
             token_data = response.json()
 
-    except (httpx.HTTPError, ValueError) as exc:
+            # Validar ORCID.
+            raw_orcid = token_data.get("orcid")
 
-        # Não expor corpo da resposta, credenciais ou detalhes do token.
+            if (
+                    not isinstance(raw_orcid, str)
+                    or not raw_orcid.strip()
+            ):
+
+                raise RuntimeError(
+                    "A ORCID não devolveu um ORCID iD."
+                )
+
+            orcid_id = normalize_orcid(
+                raw_orcid
+            )
+
+            if not is_valid_orcid(orcid_id):
+
+                raise RuntimeError(
+                    "A ORCID devolveu um identificador inválido."
+                )
+
+            # Validar access token.
+            access_token = token_data.get(
+                "access_token"
+            )
+
+            if (
+                    not isinstance(access_token, str)
+                    or not access_token
+            ):
+
+                raise RuntimeError(
+                    "A ORCID não devolveu um access token válido."
+                )
+
+            # Obter nome.
+            name = await _resolve_orcid_name(
+                client,
+                token_data,
+                orcid_id,
+            )
+
+    except (
+            httpx.HTTPError,
+            ValueError,
+    ) as exc:
+
         raise RuntimeError(
             "Falha na comunicação OAuth com a ORCID."
         ) from exc
 
-    # ========================================================
-    # VALIDAR ORCID ID
-    # ========================================================
+    # Não criar uma sessão sem identidade utilizável.
+    if not name:
 
-    raw_orcid = token_data.get("orcid")
-
-    if (
-            not isinstance(raw_orcid, str)
-            or not raw_orcid.strip()
-    ):
         raise RuntimeError(
-            "A ORCID não devolveu um ORCID iD."
+            "A ORCID autenticou a conta, mas não disponibilizou "
+            "um nome público. Verifica a visibilidade do nome "
+            "no registo ORCID e tenta novamente."
         )
 
-    orcid_id = normalize_orcid(raw_orcid)
-
-    if not is_valid_orcid(orcid_id):
-        raise RuntimeError(
-            "A ORCID devolveu um identificador inválido."
-        )
-
-    # ========================================================
-    # VALIDAR ACCESS TOKEN
-    # ========================================================
-
-    access_token = token_data.get("access_token")
-
-    if (
-            not isinstance(access_token, str)
-            or not access_token
-    ):
-        raise RuntimeError(
-            "A ORCID não devolveu um access token válido."
-        )
-
-    # ========================================================
-    # CALCULAR EXPIRAÇÃO
-    # ========================================================
-
-    expires_in = token_data.get("expires_in")
-
+    # Calcular expiração do token ORCID.
     try:
+
         expires_at = (
-                time.time() + int(expires_in)
+                time.time()
+                + int(token_data.get("expires_in"))
         )
-    except (TypeError, ValueError):
+
+    except (
+            TypeError,
+            ValueError,
+    ):
+
         expires_at = None
 
-    # ========================================================
-    # GUARDAR TOKEN NO BACKEND
-    # ========================================================
+    # Guardar token exclusivamente no backend.
+    _cleanup_expired_orcid_tokens()
 
     _AUTHENTICATED_ORCID_TOKENS[orcid_id] = {
         "access_token": access_token,
@@ -285,22 +469,10 @@ async def exchange_orcid_authorization_code(
         ),
     }
 
-    # ========================================================
-    # OBTER NOME DEVOLVIDO PELA ORCID
-    # ========================================================
-
-    name = token_data.get("name")
-
-    if not isinstance(name, str):
-        name = None
-
-    # ========================================================
-    # CRIAR SESSÃO DA APLICAÇÃO
-    # ========================================================
+    # Criar sessão opaca da aplicação.
+    _cleanup_expired_creator_sessions()
 
     creator_session_token = secrets.token_urlsafe(40)
-
-    _cleanup_expired_creator_sessions()
 
     _AUTHENTICATED_CREATOR_SESSIONS[
         creator_session_token
@@ -328,35 +500,12 @@ async def exchange_orcid_authorization_code(
 
 
 # ============================================================
-# LIMPAR SESSÕES EXPIRADAS
-# ============================================================
-
-def _cleanup_expired_creator_sessions() -> None:
-
-    now = time.time()
-
-    expired = [
-        token
-        for token, session
-        in _AUTHENTICATED_CREATOR_SESSIONS.items()
-        if session.get("expires_at", 0) <= now
-    ]
-
-    for token in expired:
-        _AUTHENTICATED_CREATOR_SESSIONS.pop(
-            token,
-            None,
-        )
-
-
-# ============================================================
 # OBTER IDENTIDADE AUTENTICADA
 # ============================================================
 
 def get_authenticated_creator_session(
         creator_session_token: str,
 ) -> dict[str, str] | None:
-    """Devolve a identidade associada a uma sessão válida."""
 
     if (
             not isinstance(creator_session_token, str)
@@ -378,14 +527,24 @@ def get_authenticated_creator_session(
     if not isinstance(creator, dict):
         return None
 
+    name = _clean_name(
+        creator.get("name")
+    )
+
+    orcid_id = normalize_orcid(
+        str(creator.get("orcid_id") or "")
+    )
+
+    if (
+            not name
+            or not is_valid_orcid(orcid_id)
+    ):
+        return None
+
     return {
         "creator_type": "person",
-        "name": str(
-            creator.get("name") or ""
-        ).strip(),
-        "orcid_id": normalize_orcid(
-            str(creator.get("orcid_id") or "")
-        ),
+        "name": name,
+        "orcid_id": orcid_id,
     }
 
 
@@ -396,12 +555,13 @@ def get_authenticated_creator_session(
 def get_authenticated_orcid_token(
         orcid_id: str,
 ) -> dict[str, Any] | None:
-    """Obtém token em memória para utilização interna futura."""
 
     normalized = normalize_orcid(orcid_id)
 
     if not is_valid_orcid(normalized):
         return None
+
+    _cleanup_expired_orcid_tokens()
 
     return _AUTHENTICATED_ORCID_TOKENS.get(
         normalized
