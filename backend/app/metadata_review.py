@@ -12,7 +12,11 @@ from app.metadata_schema import (
 )
 
 from app.orcid_service import (
-    get_authenticated_creator_session,
+    ORCIDInvalidIDError,
+    ORCIDNameUnavailableError,
+    ORCIDNotFoundError,
+    ORCIDServiceError,
+    get_public_orcid_identity,
 )
 
 from app.metadata_validation import (
@@ -258,148 +262,71 @@ async def _verify_ror_organizations(
 
 
 # ============================================================
-# EXIGIR AUTENTICAÇÃO PARA TODAS AS PESSOAS
+# OBTER NOMES PÚBLICOS DOS INVESTIGADORES
 # ============================================================
 
-def _require_authenticated_people(
+async def verify_orcid_people(
         creators: list[CreatorIdentity],
-        authenticated_creator: dict[str, str] | None,
 ) -> list[CreatorIdentity]:
-    """
-    Não aceita ORCID introduzido manualmente como prova de identidade.
-    Esta versão suporta uma pessoa autenticada por sessão e várias organizações.
-    """
+    """Valida ORCID iDs e usa o nome público devolvido pelo registo oficial."""
 
     people = [
         creator for creator in creators
         if creator.creator_type == "person"
     ]
 
-    if not people:
-        return creators
-
-    if not authenticated_creator:
-        raise HTTPException(
-            status_code=401,
-            detail=(
-                "Cada pessoa indicada como criador tem de autenticar a sua "
-                "identidade através da ORCID. Um ORCID escrito manualmente "
-                "não é suficiente."
-            ),
-        )
-
-    trusted_orcid = authenticated_creator.get("orcid")
-    if not trusted_orcid:
-        trusted_orcid = authenticated_creator.get("orcid_id")
-
-    if len(people) != 1 or people[0].orcid_id != trusted_orcid:
+    if len(people) > 1:
         raise HTTPException(
             status_code=422,
             detail=(
-                "A sessão ORCID atual só pode confirmar a pessoa autenticada. "
-                "Para esta versão, adiciona no máximo um investigador; podes "
-                "adicionar várias organizações através de ROR."
+                "Nesta versão só é possível adicionar um investigador. "
+                "Podes adicionar várias organizações através de ROR."
             ),
         )
 
-    # Substituir o nome e identificador pelos dados devolvidos pela sessão confiável.
-    trusted_identity = CreatorIdentity.model_validate(authenticated_creator)
-    for index, creator in enumerate(creators):
-        if creator.creator_type == "person":
-            creators[index] = trusted_identity
-
-    return creators
-
-
-# ============================================================
-# INCLUIR O UTILIZADOR AUTENTICADO
-# ============================================================
-
-def _merge_authenticated_creator(
-        value: Any,
-        authenticated_creator: dict[str, str],
-) -> list[CreatorIdentity]:
-    """
-    Inclui o utilizador autenticado uma única vez na lista de criadores.
-
-    A identidade recebida do backend é a fonte de verdade.
-    """
-
-    if value is None:
-
-        creators: list[Any] = []
-
-    elif isinstance(value, list):
-
-        creators = list(value)
-
-    else:
-
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": (
-                    "Os criadores têm de ser apresentados numa lista."
-                ),
-                "field": "creators",
-            },
-        )
-
-    trusted_creator = CreatorIdentity.model_validate(
-        authenticated_creator
-    )
-
-    merged: list[CreatorIdentity] = []
-
-    found_authenticated_creator = False
-
-    for item in creators:
+    for index, creator in enumerate(creators, start=1):
+        if creator.creator_type != "person":
+            continue
 
         try:
+            identity = await get_public_orcid_identity(creator.orcid_id or "")
+        except ORCIDInvalidIDError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "O formato ou checksum do ORCID iD é inválido.",
+                    "creator": index,
+                },
+            ) from exc
+        except ORCIDNotFoundError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "O ORCID iD não existe no registo público.",
+                    "creator": index,
+                },
+            ) from exc
+        except ORCIDNameUnavailableError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": str(exc),
+                    "creator": index,
+                },
+            ) from exc
+        except ORCIDServiceError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Não foi possível consultar a API ORCID. "
+                    "Tenta novamente mais tarde."
+                ),
+            ) from exc
 
-            creator = (
-                item
-                if isinstance(
-                    item,
-                    CreatorIdentity,
-                )
-                else CreatorIdentity.model_validate(
-                    item
-                )
-            )
+        creator.orcid_id = identity["orcid_id"]
+        creator.name = identity["name"]
 
-        except ValidationError:
-
-            # Mantém o item para que a validação normal
-            # produza o erro estruturado mais abaixo.
-            merged.append(item)
-
-            continue
-
-        if creator.orcid_id == trusted_creator.orcid_id:
-
-            if not found_authenticated_creator:
-
-                merged.append(
-                    trusted_creator
-                )
-
-                found_authenticated_creator = True
-
-            # Remove duplicados com o mesmo ORCID autenticado.
-            continue
-
-        merged.append(creator)
-
-    if not found_authenticated_creator:
-
-        merged.insert(
-            0,
-            trusted_creator,
-        )
-
-    return merged
-
+    return creators
 
 # ============================================================
 # APLICAR REVISÕES
@@ -413,61 +340,8 @@ async def apply_metadata_reviews(
         request.metadata
     )
 
-    authenticated_creator = None
-
-    # ========================================================
-    # 1. VALIDAR SESSÃO ORCID
-    # ========================================================
-
-    if request.orcid_session_token:
-
-        authenticated_creator = (
-            get_authenticated_creator_session(
-                request.orcid_session_token
-            )
-        )
-
-        if not authenticated_creator:
-
-            raise HTTPException(
-                status_code=401,
-                detail=(
-                    "A sessão ORCID é inválida ou expirou. "
-                    "Autentica novamente com a ORCID."
-                ),
-            )
-
-        # Mesmo antes da confirmação, a identidade autenticada
-        # aparece como sugestão no campo creators.
-
-        creators_field = metadata.creators
-
-        creators_field.suggested_value = (
-            _merge_authenticated_creator(
-                creators_field.suggested_value,
-                authenticated_creator,
-            )
-        )
-
-        # Se o cliente já enviou creators como confirmed,
-        # garantimos que a identidade autenticada está presente.
-
-        if creators_field.status == "confirmed":
-
-            creators_field.value = (
-                _merge_authenticated_creator(
-                    creators_field.value,
-                    authenticated_creator,
-                )
-            )
-
-    # ========================================================
-    # 1A. VALIDAR CRIADORES JÁ CONFIRMADOS
-    # ========================================================
-
-    # Também verificamos ROR quando o pedido não inclui uma revisão
-    # explícita de creators. Assim, não é possível contornar a consulta
-    # ao registo oficial enviando o campo já marcado como confirmed.
+    # Confirmed creator values are re-checked against the public registries,
+    # including requests that bypass the explicit review action.
 
     creators_field = metadata.creators
 
@@ -476,21 +350,11 @@ async def apply_metadata_reviews(
             and "creators" not in request.reviews
     ):
 
-        creators_to_verify = creators_field.value
-
-        if authenticated_creator:
-
-            creators_to_verify = _merge_authenticated_creator(
-                creators_to_verify,
-                authenticated_creator,
-            )
-
         creators_to_verify = _validate_creator_identities(
-            creators_to_verify
+            creators_field.value
         )
-        creators_to_verify = _require_authenticated_people(
+        creators_to_verify = await verify_orcid_people(
             creators_to_verify,
-            authenticated_creator,
         )
 
         creators_field.value = await _verify_ror_organizations(
@@ -549,8 +413,12 @@ async def apply_metadata_reviews(
 
         elif review.action == "edit":
 
-            if is_empty(
-                    review.value
+            if (
+                    is_empty(review.value)
+                    and not (
+                    field_name == "machine_learning_task"
+                    and isinstance(review.value, list)
+            )
             ):
 
                 raise HTTPException(
@@ -569,21 +437,6 @@ async def apply_metadata_reviews(
 
         elif review.action == "reject":
 
-            if (
-                    field_name == "creators"
-                    and authenticated_creator
-            ):
-
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        "O criador autenticado através da ORCID "
-                        "é incluído automaticamente. Não podes "
-                        "rejeitar todos os criadores enquanto "
-                        "esta sessão ORCID estiver associada."
-                    ),
-                )
-
             field.value = None
 
             field.status = "rejected"
@@ -598,22 +451,6 @@ async def apply_metadata_reviews(
                     f"Ação de revisão inválida: "
                     f"{review.action}"
                 ),
-            )
-
-        # ====================================================
-        # 3. GARANTIR A INCLUSÃO DO UTILIZADOR ORCID
-        # ====================================================
-
-        if (
-                field_name == "creators"
-                and authenticated_creator
-        ):
-
-            value_to_validate = (
-                _merge_authenticated_creator(
-                    value_to_validate,
-                    authenticated_creator,
-                )
             )
 
         # ====================================================
@@ -658,10 +495,7 @@ async def apply_metadata_reviews(
                     value_to_validate
                 )
             )
-            value_to_validate = _require_authenticated_people(
-                value_to_validate,
-                authenticated_creator,
-            )
+            value_to_validate = await verify_orcid_people(value_to_validate)
 
             value_to_validate = (
                 await _verify_ror_organizations(

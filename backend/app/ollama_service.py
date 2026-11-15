@@ -1,6 +1,7 @@
 
 import json
 import os
+import re
 
 import httpx
 
@@ -120,41 +121,29 @@ DATASET_TYPE:
   "Multiclass classification" as dataset_type.
 
 MACHINE_LEARNING_TASK:
-- Actively investigate whether the dataset supports a
-  machine learning task suggestion.
-- Do not restrict suggestions to tasks explicitly named
-  in the README.
-- You may infer a possible task from a combination of:
-  documentation, dataset description, column names,
-  inferred column types and sample values.
-- A task inference must have meaningful supporting evidence.
-- A column named "label", "target", "class" or "category"
-  alone is NOT sufficient evidence.
-- A categorical column alone is NOT sufficient evidence
-  for classification.
-- A numeric column alone is NOT sufficient evidence
-  for regression.
-- Look for evidence of a prediction objective, target variable,
-  known classes, annotated examples or an explicitly described
-  machine learning use case.
-- When documentation explicitly describes a task, use it.
-- When the task is a reasonable inference but not explicitly
-  documented, describe it as a possible task in the evidence
-  and use a lower confidence score.
-- Do not present an inferred task as the dataset's official
-  or intended purpose.
-- Examples of possible values:
-  classification, regression, clustering, object_detection,
-  image_classification, text_classification,
-  sentiment_analysis, named_entity_recognition,
-  machine_translation, question_answering,
-  time_series_forecasting.
-- Use the most specific task supported by evidence.
-- If evidence is insufficient, return null.
-- For inferred tasks, use:
-  source = "selected_dataset_inspection".
-- Evidence must explain which columns, values or documented
-  objectives support the inference.
+- Suggest at most ONE primary machine learning task. The user interface
+  allows the user to select additional tasks manually.
+- Use only one of these exact canonical values:
+  "Binary classification", "Multiclass classification",
+  "Text classification", "Image classification", "Regression",
+  "Clustering", "Anomaly detection", "Ranking", "Recommendation",
+  "Forecasting", "Object detection".
+- Return the selected task as a one-item list, e.g. ["Regression"].
+  If evidence is insufficient, return an empty list.
+- Infer a task only from meaningful evidence in documentation,
+  dataset description, columns, inferred types and sample values.
+- A column named label, target, class or category alone is NOT enough.
+- A categorical column alone does not prove classification; a numeric
+  column alone does not prove regression.
+- Look for a plausible prediction objective, target variable, known
+  classes, annotations, temporal structure or explicit ML use case.
+- Prefer the most specific supported task. Do not invent tasks outside
+  the canonical list and do not return multiple suggestions.
+- Explicit documentation may support higher confidence. Inferred tasks
+  must be described as possible tasks and have lower confidence.
+- Evidence must identify the columns, values or documented objective.
+- For a task inferred from the selected file, use source
+  = "selected_dataset_inspection".
 
 DATA_MODALITY:
 - Describe the data modality using the inspection.
@@ -162,27 +151,39 @@ DATA_MODALITY:
 - For inspected CSV or TSV data, use "Tabular".
 
 LANGUAGE:
-- Actively investigate the language of the dataset.
-- You may identify a language from actual natural-language
-  text in sample rows or from explicit dataset documentation.
-- Do not assume the dataset is English because column names,
-  filenames, code or README are written in English.
-- Do not use the language of repository documentation as
-  evidence for the language of the dataset.
-- Do not infer a natural language from numeric values,
-  identifiers, short codes or isolated ambiguous words.
-- Require enough representative natural-language text
-  to make a reasonable identification.
-- If several languages are clearly present, report all of them.
-- If the dataset contains no meaningful natural-language text,
-  return null.
-- Do not confuse programming languages with natural languages.
-- For a language inferred from sample rows, use:
-  source = "selected_dataset_inspection".
-- Evidence must quote or describe representative text values
-  that support the language identification.
-- Use a confidence score that reflects the amount and clarity
-  of the available text.
+- Identify the natural language(s) of the SELECTED DATASET, not the
+  programming language or language used to write the repository README.
+- Use an evidence hierarchy and state clearly which level supports the
+  prediction:
+  1. Representative natural-language text in sample_rows is strongest.
+  2. Explicit language metadata or documentation specifically describing
+     the selected dataset is also strong evidence.
+  3. If sample rows contain no usable text, the selected dataset filename
+     and repository full_name may be used as WEAK predictive clues only
+     when they contain explicit, unambiguous language terms such as
+     "english", "portuguese", "spanish", "french", "german", "italian",
+     "japanese", "chinese", "arabic", "russian", or clear language
+     suffixes such as "_en" or "-pt".
+- A repository or filename clue must never be treated as proof. Use a
+  low confidence (normally 0.40-0.60), source
+  = "repository_and_dataset_name", and evidence must say that the
+  prediction comes only from the names, not from dataset contents.
+- If sample text conflicts with a name clue, trust the representative
+  sample text and explain the conflict.
+- English column names, code, generic words such as "data", or README
+  language alone are NOT sufficient evidence.
+- Do not infer a language from numbers, identifiers, short codes,
+  isolated ambiguous words or non-linguistic values.
+- If there is not enough evidence at any level, return null.
+- Return the FULL LANGUAGE NAME, for example "English", "Portuguese",
+  "Spanish", "French" or "German".
+- Do not use ISO language codes in the suggested value.
+- If several languages are clearly represented, return a list of
+  full language names.
+- For sample-derived language, use source
+  = "selected_dataset_inspection". For explicit dataset documentation,
+  use its exact filename. Use the weak name source only as described above.
+- Confidence must reflect the strength and quantity of evidence.
 
 NUMBER_OF_RECORDS:
 - When dataset inspection is available, use exactly the
@@ -204,6 +205,110 @@ dataset, not the entire repository.
 
 Return only valid JSON matching the requested structure.
 """
+
+
+def apply_language_suggestion_from_evidence(
+        metadata: ExtractedMetadata,
+) -> None:
+    """
+    Preenche a sugestão de idioma com o nome completo,
+    utilizando a evidência que já foi produzida.
+
+    A evidência original nunca é alterada.
+    """
+
+    language_field = metadata.language
+    evidence = language_field.evidence
+
+    if not evidence:
+        return
+
+    if isinstance(evidence, list):
+        evidence_text = " ".join(
+            str(item) for item in evidence
+        )
+    else:
+        evidence_text = str(evidence)
+
+    evidence_lower = evidence_text.lower()
+
+    language_patterns = {
+        "English": [
+            r"\benglish\b",
+        ],
+        "Portuguese": [
+            r"\bportuguese\b",
+            r"\bportugu[eê]s\b",
+        ],
+        "Spanish": [
+            r"\bspanish\b",
+            r"\bespañol\b",
+            r"\bespanhol\b",
+        ],
+        "French": [
+            r"\bfrench\b",
+            r"\bfrançais\b",
+            r"\bfranc[eê]s\b",
+        ],
+        "German": [
+            r"\bgerman\b",
+            r"\bdeutsch\b",
+        ],
+        "Italian": [
+            r"\bitalian\b",
+            r"\bitaliano\b",
+        ],
+        "Japanese": [
+            r"\bjapanese\b",
+        ],
+        "Chinese": [
+            r"\bchinese\b",
+        ],
+        "Arabic": [
+            r"\barabic\b",
+        ],
+        "Russian": [
+            r"\brussian\b",
+        ],
+        "Dutch": [
+            r"\bdutch\b",
+        ],
+        "Korean": [
+            r"\bkorean\b",
+        ],
+    }
+
+    detected_languages = []
+
+    for language_name, patterns in language_patterns.items():
+
+        if any(
+                re.search(pattern, evidence_lower)
+                for pattern in patterns
+        ):
+            detected_languages.append(language_name)
+
+    if not detected_languages:
+        return
+
+    # A evidência é a fonte desta sugestão.
+    # Se existir um código abreviado ou outra sugestão do Ollama,
+    # substituímos pelo nome completo identificado na evidência.
+    language_field.suggested_value = detected_languages
+
+    # O valor confirmado continua vazio.
+    language_field.value = None
+
+    # O campo continua apenas como sugestão.
+    language_field.status = "suggested"
+
+    if not language_field.source:
+        language_field.source = "selected_dataset_inspection"
+
+    language_field.confidence = max(
+        language_field.confidence or 0,
+        0.90,
+        )
 
 
 def build_prompt(repository_data: dict) -> str:
@@ -228,21 +333,33 @@ def build_prompt(repository_data: dict) -> str:
     )
 
     sources = []
+    remaining_source_chars = 24_000
 
     for item in metadata_files:
-
-        if item.get("status") != "read":
+        if (
+                item.get("status") != "read"
+                or not isinstance(item.get("content"), str)
+        ):
             continue
 
         content = item.get("content", "")
-
-        if not isinstance(content, str):
-            continue
+        if remaining_source_chars <= 0:
+            break
+        selected_content = content[:min(5_000, remaining_source_chars)]
 
         sources.append({
             "source": item.get("path"),
-            "content": content[:30000],
+            "content": selected_content,
         })
+        remaining_source_chars -= len(selected_content)
+
+    if dataset_inspection:
+        selected_path = dataset_inspection.get("path")
+        dataset_candidates = [
+            item
+            for item in dataset_candidates
+            if item.get("path") == selected_path
+        ]
 
     payload = {
         "repository": repository,
@@ -283,7 +400,9 @@ for the selected dataset.
 
 MACHINE LEARNING TASK:
 Actively inspect the columns and sample rows for evidence
-of a possible machine learning task.
+of a possible machine learning task. Suggest at most ONE primary task,
+using only the canonical task values listed in the system instructions.
+Return it as a one-item list, or [] when evidence is insufficient.
 
 For example:
 - A documented prediction objective and a categorical
@@ -291,10 +410,10 @@ For example:
 - A documented prediction objective and a continuous
   numerical target may support regression.
 - Text samples with sentiment annotations may support
-  sentiment analysis or text classification.
-- Images with object annotations may support object detection.
-- Text samples with entity annotations may support
-  named entity recognition.
+  text classification.
+- Images with class labels may support image classification.
+- Images with bounding-box annotations may support object detection.
+- A documented numeric prediction target may support regression.
 
 These are examples, not assumptions.
 A column name alone is not enough.
@@ -303,15 +422,17 @@ a cautious suggestion with lower confidence and explain
 the uncertainty in the evidence.
 
 LANGUAGE:
-Inspect the actual sample values.
-If they contain enough natural-language text, identify
-the language or languages represented in the dataset.
+First inspect representative sample values and any explicit metadata
+for the selected dataset. If those provide no usable evidence, inspect
+only explicit language indicators in the selected filename and repository
+full_name as weak predictive clues. If using names alone, return low
+confidence (0.40-0.60), source "repository_and_dataset_name", and state
+clearly that this is a prediction from names rather than dataset content.
+Never treat the README language or English column names as proof.
+If all clues are ambiguous, return null.
 
-Do not use English column names or README text as proof
-that the dataset itself is in English.
-
-If sample rows contain only numbers, codes, identifiers
-or very short ambiguous strings, do not guess the language.
+When a language is identified, return its full name, such as
+"English" or "Portuguese", not an ISO language code.
 
 Do not invent:
 - Creators
@@ -404,7 +525,7 @@ Do not infer the language of a dataset from the README language.
         },
 
         "machine_learning_task": {
-            "value": None,
+            "value": [],
             "source": None,
             "evidence": None,
             "confidence": 0,
@@ -475,16 +596,20 @@ OUTPUT REQUIREMENTS:
 - Use a numeric integer for number_of_records.
 - Do not return Markdown or explanations outside the JSON.
 
-For source, use the exact documentation filename or
-"selected_dataset_inspection".
+For source, use the exact documentation filename,
+"selected_dataset_inspection", or "repository_and_dataset_name"
+only for a low-confidence language prediction based on explicit names.
 
 For evidence, provide a short excerpt or a concise explanation
 of the relevant inspected facts.
 
-For machine_learning_task and language, actively look for
-reasonable evidence in the selected dataset inspection.
-Do not leave these fields empty merely because the README
-does not explicitly mention them.
+For machine_learning_task, actively investigate the selected dataset
+but return at most one canonical task in a list. For language, inspect
+sample values first, then explicit dataset-specific documentation, and
+only then use clear repository/dataset name clues as a low-confidence
+prediction. Return the full language name rather than an ISO code.
+Do not leave these fields empty merely because the README does not
+explicitly mention them; do not guess when evidence is weak.
 
 Do not guess when evidence is insufficient.
 Do not use a source or evidence that does not support the value.
@@ -551,6 +676,30 @@ async def extract_with_ollama(
             metadata = ExtractedMetadata.model_validate(
                 parsed
             )
+
+            # Preenche a sugestão de idioma com o nome completo
+            # quando a evidência identifica explicitamente um idioma.
+            # A evidência original não é alterada.
+            apply_language_suggestion_from_evidence(metadata)
+
+            # A interface permite várias tarefas escolhidas pelo utilizador,
+            # mas a IA só pode propor uma tarefa principal.
+            task_field = metadata.machine_learning_task
+
+            for attribute in ("suggested_value", "value"):
+
+                task_values = getattr(
+                    task_field,
+                    attribute,
+                )
+
+                if isinstance(task_values, list) and len(task_values) > 1:
+
+                    setattr(
+                        task_field,
+                        attribute,
+                        task_values[:1],
+                    )
 
             return metadata
 

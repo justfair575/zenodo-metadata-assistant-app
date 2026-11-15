@@ -37,16 +37,23 @@ from app.metadata_schema import (
     ExtractedMetadata,
 )
 
-from app.metadata_review import apply_metadata_reviews
+from app.metadata_review import (
+    apply_metadata_reviews,
+    verify_orcid_people,
+)
 from app.metadata_validation import validate_metadata_field
 
 from app.croissant_generator import build_croissant
 
 from app.orcid_service import (
+    ORCIDInvalidIDError,
+    ORCIDNameUnavailableError,
+    ORCIDNotFoundError,
+    ORCIDServiceError,
     create_orcid_authorization_url,
     consume_orcid_state,
     exchange_orcid_authorization_code,
-    get_authenticated_creator_session,
+    get_public_orcid_identity,
 )
 
 from app.ror_service import (
@@ -205,10 +212,7 @@ async def inspect_dataset(
 ):
 
     repository_data = await analyze_github_repository(
-        AnalyzeRequest(
-            url=request.url,
-            ref=request.ref,
-        )
+        request
     )
 
     inspection = await inspect_dataset_in_repository(
@@ -231,10 +235,7 @@ async def extract_dataset_metadata(
     # 1. Analisar o repositório.
 
     repository_data = await analyze_github_repository(
-        AnalyzeRequest(
-            url=request.url,
-            ref=request.ref,
-        )
+        request
     )
 
     # 2. Inspecionar o dataset selecionado.
@@ -370,52 +371,14 @@ async def generate_croissant_endpoint(
             detail=detail,
         )
 
-    # 1A. Revalidar os identificadores ROR no registo oficial.
+    # 1A. Revalidar ORCID e ROR nos registos oficiais.
     # A confirmação anterior não deve ser contornável por um pedido
     # direto ao endpoint de geração com metadata marcada como confirmed.
 
     creators_field = request.metadata.creators
-    people = [
-        creator for creator in creators_field.value
-        if creator.creator_type == "person"
-    ]
-
-    if people:
-        if not request.orcid_session_token:
-            raise HTTPException(
-                status_code=401,
-                detail=(
-                    "A identidade de cada pessoa tem de ser autenticada "
-                    "através da ORCID antes de gerar o Croissant."
-                ),
-            )
-
-        authenticated_creator = get_authenticated_creator_session(
-            request.orcid_session_token
-        )
-        if not authenticated_creator:
-            raise HTTPException(
-                status_code=401,
-                detail="A sessão ORCID é inválida ou expirou. Autentica novamente.",
-            )
-
-        trusted_orcid = (
-                authenticated_creator.get("orcid_id")
-                or authenticated_creator.get("orcid")
-        )
-        if len(people) != 1 or people[0].orcid_id != trusted_orcid:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "A pessoa indicada nos metadados não corresponde à "
-                    "identidade ORCID autenticada nesta sessão."
-                ),
-            )
-
-        people[0].name = authenticated_creator.get("name") or people[0].name
+    creators_field.value = await verify_orcid_people(creators_field.value)
 
     for index, creator in enumerate(creators_field.value, start=1):
-
         if creator.creator_type != "organization":
             continue
 
@@ -458,10 +421,7 @@ async def generate_croissant_endpoint(
     # 2. Analisar novamente o repositório.
 
     repository_data = await analyze_github_repository(
-        AnalyzeRequest(
-            url=request.url,
-            ref=request.ref,
-        )
+        request
     )
 
     # 3. Inspecionar novamente o dataset selecionado.
@@ -646,6 +606,39 @@ async def generate_croissant_endpoint(
 # ============================================================
 # ORCID OAUTH
 # ============================================================
+
+@app.get("/api/v1/orcid/validate/{orcid_id}")
+async def validate_orcid_record(
+        orcid_id: str,
+):
+    """Obtém o nome público associado a um ORCID iD."""
+
+    try:
+        return await get_public_orcid_identity(orcid_id)
+    except ORCIDInvalidIDError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        ) from exc
+    except ORCIDNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
+        ) from exc
+    except ORCIDNameUnavailableError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        ) from exc
+    except ORCIDServiceError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Não foi possível consultar a API ORCID. "
+                "Tenta novamente mais tarde."
+            ),
+        ) from exc
+
 
 @app.get("/api/v1/orcid/authorize")
 async def orcid_authorize():
