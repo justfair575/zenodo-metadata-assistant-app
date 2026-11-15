@@ -1,4 +1,3 @@
-
 import json
 from pathlib import Path
 from typing import Any
@@ -9,7 +8,11 @@ from fastapi import HTTPException
 
 from croissant_baker.metadata_generator import MetadataGenerator
 
-from app.metadata_schema import ExtractedMetadata, MetadataField
+from app.metadata_schema import (
+    CreatorIdentity,
+    ExtractedMetadata,
+    MetadataField,
+)
 
 
 REQUIRED_FIELDS = [
@@ -24,6 +27,7 @@ REQUIRED_FIELDS = [
 
 
 def is_empty(value: Any) -> bool:
+
     if value is None:
         return True
 
@@ -79,6 +83,13 @@ def get_optional_confirmed_value(
 
 
 def normalize_creators(value: Any) -> list[dict[str, str]]:
+    """
+    Normaliza os criadores confirmados.
+
+    Aceita CreatorIdentity (a representação usada pelo schema atual)
+    e dicionários. Cada criador confirmado tem de indicar explicitamente
+    person/organization e o identificador correspondente.
+    """
 
     if isinstance(value, str):
         value = [value]
@@ -89,34 +100,110 @@ def normalize_creators(value: Any) -> list[dict[str, str]]:
             detail="É necessário indicar pelo menos um criador.",
         )
 
-    creators = []
+    creators: list[dict[str, str]] = []
 
-    for creator in value:
+    for index, creator in enumerate(value, start=1):
 
-        if isinstance(creator, str):
-            creator_data = {
-                "name": creator.strip(),
-            }
+        if isinstance(creator, CreatorIdentity):
+            creator_data = creator.model_dump(exclude_none=True)
 
         elif isinstance(creator, dict):
             creator_data = {
-                str(key): str(item).strip()
+                str(key): item
                 for key, item in creator.items()
-                if item is not None and str(item).strip()
+                if item is not None
             }
 
         else:
-            creator_data = {}
-
-        if not creator_data.get("name"):
             raise HTTPException(
                 status_code=422,
-                detail="Cada criador tem de possuir um nome.",
+                detail=f"O criador {index} tem um formato inválido.",
             )
 
-        creators.append(creator_data)
+        name = creator_data.get("name")
+        creator_type = creator_data.get("creator_type")
+        orcid_id = creator_data.get("orcid_id")
+        ror_id = creator_data.get("ror_id")
+
+        if not isinstance(name, str) or not name.strip():
+            raise HTTPException(
+                status_code=422,
+                detail=f"O criador {index} tem de possuir um nome.",
+            )
+
+        if creator_type == "person":
+
+            if not orcid_id or ror_id:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"O criador {index} é uma pessoa e necessita "
+                        "de ORCID, sem ROR."
+                    ),
+                )
+
+        elif creator_type == "organization":
+
+            if not ror_id or orcid_id:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"O criador {index} é uma organização e necessita "
+                        "de ROR, sem ORCID."
+                    ),
+                )
+
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"O criador {index} tem de indicar creator_type "
+                    "como 'person' ou 'organization'."
+                ),
+            )
+
+        normalized = {
+            "creator_type": creator_type,
+            "name": name.strip(),
+        }
+
+        if creator_type == "person":
+            normalized["orcid_id"] = str(orcid_id).strip()
+
+        else:
+            normalized["ror_id"] = str(ror_id).strip()
+
+        creators.append(normalized)
 
     return creators
+
+
+def build_croissant_creators(
+        creators: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Constrói entidades schema.org Person/Organization com ORCID/ROR."""
+
+    result: list[dict[str, str]] = []
+
+    for creator in creators:
+
+        if creator["creator_type"] == "organization":
+
+            result.append({
+                "@type": "sc:Organization",
+                "name": creator["name"],
+                "identifier": creator["ror_id"],
+            })
+
+        else:
+
+            result.append({
+                "@type": "sc:Person",
+                "name": creator["name"],
+                "identifier": creator["orcid_id"],
+            })
+
+    return result
 
 
 def normalize_string_list(value: Any) -> list[str]:
@@ -213,10 +300,13 @@ def build_croissant(
             detail="Caminho local do dataset inválido.",
         )
 
-    local_dataset = (dataset_directory / relative_path).resolve()
+    local_dataset = (
+            dataset_directory / relative_path
+    ).resolve()
 
     try:
         local_dataset.relative_to(dataset_directory)
+
     except ValueError as exc:
         raise HTTPException(
             status_code=422,
@@ -261,9 +351,19 @@ def build_croissant(
         "language",
     )
 
-    date_published = str(values["date_published"]).strip()
+    date_published = str(
+        values["date_published"]
+    ).strip()
 
     # 5. Criar o MetadataGenerator.
+
+    # O Baker recebe apenas os nomes. As entidades tipadas e os
+    # identificadores ORCID/ROR são acrescentados ao JSON-LD final.
+
+    baker_creators = [
+        {"name": creator["name"]}
+        for creator in creators
+    ]
 
     generator = MetadataGenerator(
         dataset_path=str(dataset_directory),
@@ -272,7 +372,7 @@ def build_croissant(
         url=repository_url,
         license=str(values["license"]),
         date_published=date_published,
-        creators=creators,
+        creators=baker_creators,
         keywords=(
             normalize_string_list(keywords)
             if keywords
@@ -304,7 +404,10 @@ def build_croissant(
     except Exception as exc:
         raise HTTPException(
             status_code=422,
-            detail=f"O Croissant Baker não conseguiu gerar os metadados: {exc}",
+            detail=(
+                "O Croissant Baker não conseguiu gerar os metadados: "
+                f"{exc}"
+            ),
         ) from exc
 
     if not output_path.is_file():
@@ -325,7 +428,21 @@ def build_croissant(
             detail="Não foi possível ler o JSON-LD gerado.",
         ) from exc
 
-    # 8. Substituir o contentUrl local pelo URL do commit GitHub.
+    # 8. Remover defaults que o Baker possa acrescentar sem confirmação.
+    # A aplicação ainda não recolhe version, citeAs, publisher,
+    # dateCreated ou dateModified como metadados confirmados.
+    # Não devemos publicar esses valores como se fossem factos fornecidos.
+
+    for unconfirmed_field in (
+            "version",
+            "citeAs",
+            "publisher",
+            "dateCreated",
+            "dateModified",
+    ):
+        croissant.pop(unconfirmed_field, None)
+
+    # 9. Substituir o contentUrl local pelo URL do commit GitHub.
     # O SHA-256 calculado pelo Baker é preservado.
 
     distributions = croissant.get("distribution", [])
@@ -339,22 +456,16 @@ def build_croissant(
     for distribution in distributions:
         distribution["contentUrl"] = source_content_url
 
-    # 9. Garantir os valores confirmados do GG ADS no documento final.
+    # 10. Garantir os valores confirmados do GG ADS no documento final.
 
     croissant["name"] = values["title"]
     croissant["description"] = values["description"]
     croissant["url"] = repository_url
     croissant["datePublished"] = date_published
 
-    croissant["creator"] = [
-        {
-            "@type": "sc:Person",
-            **creator,
-        }
-        for creator in creators
-    ]
+    croissant["creator"] = build_croissant_creators(creators)
 
-    # 10. Acrescentar os campos específicos da aplicação.
+    # 11. Acrescentar os campos específicos da aplicação.
 
     add_property(
         croissant,
@@ -410,7 +521,7 @@ def build_croissant(
             machine_learning_task,
         )
 
-    # 11. Guardar o documento final.
+    # 12. Guardar o documento final.
 
     try:
         with output_path.open("w", encoding="utf-8") as file:
@@ -427,7 +538,7 @@ def build_croissant(
             detail="Não foi possível guardar o documento Croissant.",
         ) from exc
 
-    # 12. Validar o documento FINAL com mlcroissant.
+    # 13. Validar o documento FINAL com mlcroissant.
 
     try:
         validated_dataset = mlc.Dataset(

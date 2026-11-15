@@ -1,12 +1,33 @@
-
 import { useEffect, useState, type FormEvent } from "react";
 import "./App.css";
 
 const API_URL = "http://localhost:8000";
 
 type ReviewStatus = "suggested" | "confirmed" | "rejected";
-
 type ReviewAction = "accept" | "edit" | "reject";
+
+type CreatorIdentity = {
+  creator_type: "person" | "organization";
+  name: string;
+  orcid_id?: string | null;
+  ror_id?: string | null;
+};
+
+type OrcidPopupMessage = {
+  source: "zenodo-metadata-orcid";
+  status: "authenticated" | "error";
+  creator?: CreatorIdentity;
+  creator_session_token?: string;
+  message?: string;
+};
+
+type RorValidation = {
+  valid: boolean;
+  exists: boolean;
+  ror_id: string;
+  ror_url: string;
+  name: string;
+};
 
 type MetadataField = {
   suggested_value: unknown;
@@ -120,6 +141,7 @@ type CroissantResult = {
   repository: string;
   commit_sha: string;
   selected_dataset: string;
+  metadata_verified?: boolean;
   croissant: Record<string, unknown>;
 };
 
@@ -147,15 +169,6 @@ const FIELD_LABELS: Record<MetadataFieldName, string> = {
   number_of_records: "Número de registos",
 };
 
-function getTodayDate(): string {
-  const today = new Date();
-  const year = today.getFullYear();
-  const month = String(today.getMonth() + 1).padStart(2, "0");
-  const day = String(today.getDate()).padStart(2, "0");
-
-  return `${year}-${month}-${day}`;
-}
-
 function isEmpty(value: unknown): boolean {
   if (value === null || value === undefined) {
     return true;
@@ -182,6 +195,9 @@ function displayValue(value: unknown): string {
   }
 
   if (Array.isArray(value)) {
+    if (value.some((item) => item !== null && typeof item === "object")) {
+      return JSON.stringify(value, null, 2);
+    }
     return value.map((item) => String(item)).join(", ");
   }
 
@@ -200,11 +216,16 @@ function fieldToInput(
     return "";
   }
 
-  if (
-      (fieldName === "creators" || fieldName === "keywords") &&
-      Array.isArray(value)
-  ) {
+  if (fieldName === "creators") {
+    return JSON.stringify(value, null, 2);
+  }
+
+  if (fieldName === "keywords" && Array.isArray(value)) {
     return value.map((item) => String(item)).join("\n");
+  }
+
+  if (fieldName === "date_published" && typeof value === "string") {
+    return value.slice(0, 10);
   }
 
   return typeof value === "string"
@@ -216,7 +237,25 @@ function parseFieldInput(
     fieldName: MetadataFieldName,
     input: string,
 ): unknown {
-  if (fieldName === "creators" || fieldName === "keywords") {
+  if (fieldName === "creators") {
+    let parsed: unknown;
+
+    try {
+      parsed = JSON.parse(input);
+    } catch {
+      throw new Error(
+          "Os criadores devem ser introduzidos como um array JSON de objetos.",
+      );
+    }
+
+    if (!Array.isArray(parsed)) {
+      throw new Error("Os criadores devem ser um array JSON.");
+    }
+
+    return parsed;
+  }
+
+  if (fieldName === "keywords") {
     return input
         .split("\n")
         .map((item) => item.trim())
@@ -224,6 +263,14 @@ function parseFieldInput(
   }
 
   return input.trim();
+}
+
+function getLocalDate(): string {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function getErrorMessage(data: any, fallback: string): string {
@@ -249,34 +296,35 @@ function App() {
   const [ref, setRef] = useState("");
 
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
-
   const [selectedDatasetPath, setSelectedDatasetPath] = useState("");
 
-  const [extraction, setExtraction] =
-      useState<ExtractionResult | null>(null);
+  const [extraction, setExtraction] = useState<ExtractionResult | null>(null);
 
   const [editingValues, setEditingValues] =
       useState<Partial<Record<MetadataFieldName, string>>>({});
 
+  // Identidades estruturadas dos criadores. Os nomes são sempre obtidos
+  // através da ORCID (pessoas) ou do registo ROR (organizações).
+  const [creatorDraft, setCreatorDraft] = useState<CreatorIdentity[]>([]);
+  const [orcidSessionToken, setOrcidSessionToken] = useState("");
+  const [rorInput, setRorInput] = useState("");
+  const [rorBusy, setRorBusy] = useState(false);
+  const [creatorMessage, setCreatorMessage] = useState("");
+  const [creatorError, setCreatorError] = useState("");
+
   const [confirmation, setConfirmation] =
       useState<ConfirmationResult | null>(null);
 
-  const [croissant, setCroissant] =
-      useState<CroissantResult | null>(null);
+  const [croissant, setCroissant] = useState<CroissantResult | null>(null);
 
   const [error, setError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
 
   const [loading, setLoading] = useState(false);
-  const [busyField, setBusyField] =
-      useState<MetadataFieldName | null>(null);
+  const [busyField, setBusyField] = useState<MetadataFieldName | null>(null);
 
-  const [ollamaAvailable, setOllamaAvailable] =
-      useState<boolean | null>(null);
-
-  const [modelInstalled, setModelInstalled] =
-      useState<boolean | null>(null);
-
+  const [ollamaAvailable, setOllamaAvailable] = useState<boolean | null>(null);
+  const [modelInstalled, setModelInstalled] = useState<boolean | null>(null);
   const [configuredModel, setConfiguredModel] = useState("Ollama");
 
   // ==========================================================
@@ -301,6 +349,38 @@ function App() {
         });
   }, []);
 
+  // Recebe apenas mensagens do callback OAuth servido pelo backend local.
+  useEffect(() => {
+    function handleOrcidMessage(event: MessageEvent<OrcidPopupMessage>) {
+      if (event.origin !== API_URL || event.data?.source !== "zenodo-metadata-orcid") {
+        return;
+      }
+
+      const data = event.data;
+      if (data.status === "error") {
+        setCreatorError(data.message || "Não foi possível autenticar a ORCID.");
+        return;
+      }
+
+      if (!data.creator || !data.creator_session_token) {
+        setCreatorError("A resposta da ORCID não contém a identidade e a sessão necessárias.");
+        return;
+      }
+
+      setOrcidSessionToken(data.creator_session_token);
+      setCreatorDraft((previous) => {
+        const withoutPerson = previous.filter((item) => item.creator_type !== "person");
+        return [...withoutPerson, data.creator!];
+      });
+      setCreatorError("");
+      setCreatorMessage(`Identidade ORCID autenticada: ${data.creator.name}.`);
+      setEditingValues((previous) => ({ ...previous, creators: "" }));
+    }
+
+    window.addEventListener("message", handleOrcidMessage);
+    return () => window.removeEventListener("message", handleOrcidMessage);
+  }, []);
+
   // ==========================================================
   // ANALYZE REPOSITORY
   // ==========================================================
@@ -318,21 +398,23 @@ function App() {
     setCroissant(null);
     setSelectedDatasetPath("");
     setEditingValues({});
+    setCreatorDraft([]);
+    setOrcidSessionToken("");
+    setRorInput("");
+    setCreatorMessage("");
+    setCreatorError("");
 
     try {
-      const response = await fetch(
-          `${API_URL}/api/v1/analyze`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              url,
-              ...(ref.trim() ? { ref: ref.trim() } : {}),
-            }),
-          },
-      );
+      const response = await fetch(`${API_URL}/api/v1/analyze`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          url,
+          ...(ref.trim() ? { ref: ref.trim() } : {}),
+        }),
+      });
 
       const data = await response.json().catch(() => ({}));
 
@@ -354,9 +436,7 @@ function App() {
         );
       }
     } catch (err) {
-      setError(
-          err instanceof Error ? err.message : "Erro inesperado.",
-      );
+      setError(err instanceof Error ? err.message : "Erro inesperado.");
     } finally {
       setLoading(false);
     }
@@ -387,22 +467,24 @@ function App() {
     setConfirmation(null);
     setCroissant(null);
     setEditingValues({});
+    setCreatorDraft([]);
+    setOrcidSessionToken("");
+    setRorInput("");
+    setCreatorMessage("");
+    setCreatorError("");
 
     try {
-      const response = await fetch(
-          `${API_URL}/api/v1/extract-dataset`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              url,
-              ...(ref.trim() ? { ref: ref.trim() } : {}),
-              dataset_path: selectedDatasetPath,
-            }),
-          },
-      );
+      const response = await fetch(`${API_URL}/api/v1/extract-dataset`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          url,
+          ...(ref.trim() ? { ref: ref.trim() } : {}),
+          dataset_path: selectedDatasetPath,
+        }),
+      });
 
       const data = await response.json().catch(() => ({}));
 
@@ -413,23 +495,94 @@ function App() {
       }
 
       setExtraction(data as ExtractionResult);
-
       setSuccessMessage(
           "Dataset inspecionado. Revê agora as sugestões de metadados.",
       );
     } catch (err) {
-      setError(
-          err instanceof Error ? err.message : "Erro inesperado.",
-      );
+      setError(err instanceof Error ? err.message : "Erro inesperado.");
     } finally {
       setLoading(false);
     }
   }
 
   // ==========================================================
-  // REVIEW METADATA FIELD
+  // CRIADORES: ORCID E ROR
   // ==========================================================
 
+  function startOrcidAuthentication() {
+    setCreatorError("");
+    setCreatorMessage("");
+    const popup = window.open(
+        `${API_URL}/api/v1/orcid/authorize`,
+        "zenodo-orcid-auth",
+        "popup=yes,width=620,height=760",
+    );
+
+    if (!popup) {
+      setCreatorError("O navegador bloqueou a janela ORCID. Permite pop-ups para esta aplicação e tenta novamente.");
+    }
+  }
+
+  async function addOrganizationByRor() {
+    const identifier = rorInput.trim();
+    if (!identifier) {
+      setCreatorError("Introduz um ROR ID ou URL ROR.");
+      return;
+    }
+
+    setRorBusy(true);
+    setCreatorError("");
+    setCreatorMessage("");
+
+    try {
+      const response = await fetch(
+          `${API_URL}/api/v1/ror/validate/${encodeURIComponent(identifier)}`,
+      );
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(getErrorMessage(data, "Não foi possível validar o ROR ID."));
+      }
+
+      const organization = data as RorValidation;
+      if (!organization.valid || !organization.exists || !organization.name) {
+        throw new Error("O ROR ID não corresponde a uma organização válida.");
+      }
+
+      setCreatorDraft((previous) => {
+        if (previous.some((item) => item.creator_type === "organization" && item.ror_id === organization.ror_id)) {
+          return previous;
+        }
+        return [
+          ...previous,
+          {
+            creator_type: "organization",
+            name: organization.name,
+            ror_id: organization.ror_id,
+          },
+        ];
+      });
+      setRorInput("");
+      setCreatorMessage(`Organização adicionada a partir do registo ROR: ${organization.name}.`);
+    } catch (err) {
+      setCreatorError(err instanceof Error ? err.message : "Erro ao validar a organização.");
+    } finally {
+      setRorBusy(false);
+    }
+  }
+
+  function removeCreator(index: number) {
+    const removed = creatorDraft[index];
+    setCreatorDraft((previous) => previous.filter((_, itemIndex) => itemIndex !== index));
+
+    if (removed?.creator_type === "person") {
+      setOrcidSessionToken("");
+    }
+  }
+
+  // ==========================================================
+  // REVIEW METADATA FIELD
+  // ==========================================================
 
   async function reviewField(
       fieldName: MetadataFieldName,
@@ -440,22 +593,26 @@ function App() {
     }
 
     const field = extraction.metadata[fieldName];
-
     let editedValue: unknown = undefined;
 
     if (action === "edit") {
       const input =
           editingValues[fieldName] ??
-          fieldToInput(fieldName, field.value);
+          fieldToInput(
+              fieldName,
+              !isEmpty(field.value) ? field.value : field.suggested_value,
+          );
 
-      editedValue = parseFieldInput(fieldName, input);
-
-      if (
-          fieldName === "date_published" &&
-          typeof editedValue === "string" &&
-          editedValue > getTodayDate()
-      ) {
-        setError("A data de publicação não pode ser posterior à data de hoje.");
+      try {
+        editedValue = fieldName === "creators"
+            ? creatorDraft
+            : parseFieldInput(fieldName, input);
+      } catch (parseError) {
+        setError(
+            parseError instanceof Error
+                ? parseError.message
+                : "O valor introduzido não tem um formato válido.",
+        );
         return;
       }
 
@@ -477,21 +634,21 @@ function App() {
         ...(action === "edit" ? { value: editedValue } : {}),
       };
 
-      const response = await fetch(
-          `${API_URL}/api/v1/metadata/confirm`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              metadata: extraction.metadata,
-              reviews: {
-                [fieldName]: review,
-              },
-            }),
+      const response = await fetch(`${API_URL}/api/v1/metadata/confirm`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          metadata: extraction.metadata,
+          reviews: {
+            [fieldName]: review,
           },
-      );
+          ...(orcidSessionToken
+              ? { orcid_session_token: orcidSessionToken }
+              : {}),
+        }),
+      });
 
       const data = await response.json().catch(() => ({}));
 
@@ -563,9 +720,7 @@ function App() {
         );
       }
     } catch (err) {
-      setError(
-          err instanceof Error ? err.message : "Erro inesperado.",
-      );
+      setError(err instanceof Error ? err.message : "Erro inesperado.");
     } finally {
       setBusyField(null);
     }
@@ -583,10 +738,7 @@ function App() {
     return REQUIRED_FIELDS.filter((fieldName) => {
       const field = extraction.metadata[fieldName];
 
-      return (
-          field.status !== "confirmed" ||
-          isEmpty(field.value)
-      );
+      return field.status !== "confirmed" || isEmpty(field.value);
     });
   }
 
@@ -616,21 +768,19 @@ function App() {
     setCroissant(null);
 
     try {
-      const response = await fetch(
-          `${API_URL}/api/v1/croissant/generate`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              url,
-              ...(ref.trim() ? { ref: ref.trim() } : {}),
-              dataset_path: selectedDatasetPath,
-              metadata: extraction.metadata,
-            }),
-          },
-      );
+      const response = await fetch(`${API_URL}/api/v1/croissant/generate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          url,
+          ...(ref.trim() ? { ref: ref.trim() } : {}),
+          dataset_path: selectedDatasetPath,
+          metadata: extraction.metadata,
+          ...(orcidSessionToken ? { orcid_session_token: orcidSessionToken } : {}),
+        }),
+      });
 
       const data = await response.json().catch(() => ({}));
 
@@ -641,14 +791,9 @@ function App() {
       }
 
       setCroissant(data as CroissantResult);
-
-      setSuccessMessage(
-          "Croissant gerado e validado com sucesso!",
-      );
+      setSuccessMessage("Croissant gerado e validado com sucesso!");
     } catch (err) {
-      setError(
-          err instanceof Error ? err.message : "Erro inesperado.",
-      );
+      setError(err instanceof Error ? err.message : "Erro inesperado.");
     } finally {
       setLoading(false);
     }
@@ -663,11 +808,7 @@ function App() {
       return;
     }
 
-    const json = JSON.stringify(
-        croissant.croissant,
-        null,
-        2,
-    );
+    const json = JSON.stringify(croissant.croissant, null, 2);
 
     const blob = new Blob(
         [json],
@@ -675,7 +816,6 @@ function App() {
     );
 
     const downloadUrl = URL.createObjectURL(blob);
-
     const link = document.createElement("a");
 
     link.href = downloadUrl;
@@ -689,7 +829,7 @@ function App() {
   }
 
   // ==========================================================
-  // METADATA FIELD RENDERING
+  // METADATA FIELD RENDERING — CARDS
   // ==========================================================
 
   function renderMetadataField(
@@ -707,19 +847,25 @@ function App() {
     }
 
     const fieldBusy = busyField === fieldName;
+    const hasSuggestion = !isEmpty(field.suggested_value);
+    const hasCurrentValue = !isEmpty(field.value);
+    const shownValue = hasCurrentValue
+        ? field.value
+        : field.suggested_value;
 
     const inputValue =
         editingValues[fieldName] ??
-        fieldToInput(fieldName, field.value);
-
-    const hasSuggestion = !isEmpty(field.suggested_value);
+        fieldToInput(
+            fieldName,
+            hasCurrentValue ? field.value : field.suggested_value,
+        );
 
     const statusLabel =
         field.status === "confirmed"
-            ? "Confirmado"
+            ? "Confirmado pelo utilizador"
             : field.status === "rejected"
                 ? "Rejeitado"
-                : "Por confirmar";
+                : "Por rever";
 
     const statusClass =
         field.status === "confirmed"
@@ -728,105 +874,195 @@ function App() {
                 ? "status-missing"
                 : "status-pending";
 
+    const canAcceptSuggestion =
+        fieldName !== "creators" && hasSuggestion && field.status !== "confirmed";
+
     return (
         <article
-            className="metadata-field"
+            className={`metadata-card ${field.status}`}
             key={fieldName}
         >
-          <div className="field-header">
-            <strong>
-              {FIELD_LABELS[fieldName]}
-              {required ? " *" : ""}
-            </strong>
+          <div className="metadata-card-top">
+            <div>
+              <p className="card-kicker">
+                {required ? "CAMPO OBRIGATÓRIO" : "CAMPO OPCIONAL"}
+              </p>
 
-            <span className={statusClass}>
+              <h3>
+                {FIELD_LABELS[fieldName]}
+                {required ? <span className="required-mark"> *</span> : ""}
+              </h3>
+            </div>
+
+            <span className={`status-pill ${statusClass}`}>
             {statusLabel}
           </span>
           </div>
 
-          <p className="field-value">
-            {displayValue(field.value)}
-          </p>
+          <div className="suggestion-panel">
+          <span className="value-label">
+            {field.status === "confirmed"
+                ? "Valor confirmado"
+                : "Sugestão atual"}
+          </span>
+
+            <p className="field-value">
+              {displayValue(shownValue)}
+            </p>
+          </div>
 
           {field.source && (
-              <p className="field-source">
-                Fonte: {field.source}
-              </p>
+              <div className="evidence-block">
+                <span className="value-label">Fonte</span>
+                <p className="field-source">{field.source}</p>
+              </div>
           )}
 
           {field.evidence && (
-              <details>
-                <summary>Ver evidência</summary>
+              <details className="evidence-details">
+                <summary>Consultar evidência</summary>
                 <p>{field.evidence}</p>
               </details>
           )}
 
-          {!isEmpty(field.suggested_value) && (
-              <details>
-                <summary>Ver sugestão original da IA</summary>
-                <p>
-                  {displayValue(field.suggested_value)}
-                </p>
-              </details>
-          )}
-
           {hasSuggestion && (
-              <p className="field-confidence">
-                Confiança estimada:{" "}
-                {(field.confidence * 100).toFixed(0)}%
-              </p>
+              <div className="confidence-row">
+                <span>Confiança estimada pela IA</span>
+                <strong>{(field.confidence * 100).toFixed(0)}%</strong>
+              </div>
           )}
 
-          <label>
-            {fieldName === "creators" || fieldName === "keywords"
-                ? "Um valor por linha"
-                : "Editar valor"}
-          </label>
+          <div className="editor-block">
+            {fieldName === "creators" ? (
+                <div className="creators-editor">
+                  <div className="creator-type-actions">
+                    <button
+                        type="button"
+                        className="button-primary"
+                        onClick={startOrcidAuthentication}
+                        disabled={loading || creatorDraft.some((item) => item.creator_type === "person")}
+                    >
+                      {creatorDraft.some((item) => item.creator_type === "person")
+                          ? "Investigador autenticado"
+                          : "Adicionar investigador com ORCID"}
+                    </button>
+                  </div>
+                  <p className="editor-help">
+                    A pessoa é identificada através da autenticação ORCID. O nome e o ORCID
+                    são recebidos diretamente da ORCID; não introduzas nomes manualmente.
+                  </p>
 
-          {fieldName === "date_published" ? (
-              <input
-                  className="field-editor"
-                  type="date"
-                  max={getTodayDate()}
-                  value={inputValue}
-                  onChange={(event) =>
-                      setEditingValues((previous) => ({
-                        ...previous,
-                        [fieldName]: event.target.value,
-                      }))
-                  }
-                  disabled={fieldBusy || loading}
-              />
-          ) : (
-              <textarea
-                  className="field-editor"
-                  rows={fieldName === "description" ? 4 : 2}
-                  value={inputValue}
-                  onChange={(event) =>
-                      setEditingValues((previous) => ({
-                        ...previous,
-                        [fieldName]: event.target.value,
-                      }))
-                  }
-                  placeholder={`Introduz ${FIELD_LABELS[fieldName].toLowerCase()}`}
-                  disabled={fieldBusy || loading}
-              />
-          )}
+                  <label htmlFor="creator-ror">Adicionar organização através de ROR ID</label>
+                  <div className="ror-entry">
+                    <input
+                        id="creator-ror"
+                        type="text"
+                        value={rorInput}
+                        onChange={(event) => setRorInput(event.target.value)}
+                        placeholder="Ex.: 01c27hj86 ou https://ror.org/01c27hj86"
+                        disabled={loading || rorBusy}
+                    />
+                    <button
+                        type="button"
+                        className="button-secondary"
+                        onClick={() => void addOrganizationByRor()}
+                        disabled={loading || rorBusy || !rorInput.trim()}
+                    >
+                      {rorBusy ? "A validar..." : "Validar e adicionar"}
+                    </button>
+                  </div>
+                  <p className="editor-help">
+                    A designação da organização é obtida automaticamente no registo ROR.
+                    A existência de um registo ROR não comprova autorização para representar
+                    essa organização.
+                  </p>
+
+                  {creatorError && <p className="creator-feedback error">{creatorError}</p>}
+                  {creatorMessage && <p className="creator-feedback success">{creatorMessage}</p>}
+
+                  {creatorDraft.length > 0 ? (
+                      <ul className="creator-list">
+                        {creatorDraft.map((creator, index) => (
+                            <li key={`${creator.creator_type}-${creator.orcid_id || creator.ror_id}`}>
+                              <div>
+                                <strong>{creator.name}</strong>
+                                <span>
+                            {creator.creator_type === "person"
+                                ? `Investigador · ORCID ${creator.orcid_id}`
+                                : `Organização · ROR ${creator.ror_id}`}
+                          </span>
+                              </div>
+                              <button
+                                  type="button"
+                                  className="button-quiet"
+                                  onClick={() => removeCreator(index)}
+                                  disabled={loading || fieldBusy}
+                              >
+                                Remover
+                              </button>
+                            </li>
+                        ))}
+                      </ul>
+                  ) : (
+                      <p className="creator-empty">Ainda não adicionaste investigadores ou organizações.</p>
+                  )}
+                </div>
+            ) : (
+                <>
+                  <label htmlFor={`editor-${fieldName}`}>
+                    {fieldName === "keywords"
+                        ? "Editar palavras-chave (uma por linha)"
+                        : "Editar valor"}
+                  </label>
+
+                  {fieldName === "date_published" ? (
+                      <input
+                          id={`editor-${fieldName}`}
+                          className="field-editor date-editor"
+                          type="date"
+                          max={getLocalDate()}
+                          value={inputValue}
+                          onChange={(event) =>
+                              setEditingValues((previous) => ({
+                                ...previous,
+                                [fieldName]: event.target.value,
+                              }))
+                          }
+                          disabled={fieldBusy || loading}
+                      />
+                  ) : (
+                      <textarea
+                          id={`editor-${fieldName}`}
+                          className="field-editor"
+                          rows={fieldName === "description" ? 5 : 3}
+                          value={inputValue}
+                          onChange={(event) =>
+                              setEditingValues((previous) => ({
+                                ...previous,
+                                [fieldName]: event.target.value,
+                              }))
+                          }
+                          placeholder={`Introduz ${FIELD_LABELS[fieldName].toLowerCase()}`}
+                          disabled={fieldBusy || loading}
+                      />
+                  )}
+                </>
+            )}
+
+          </div>
 
           <div className="field-actions">
             <button
+                className="button-primary"
                 type="button"
                 onClick={() => void reviewField(fieldName, "accept")}
-                disabled={
-                    fieldBusy ||
-                    loading ||
-                    !hasSuggestion
-                }
+                disabled={fieldBusy || loading || !canAcceptSuggestion}
             >
-              Aceitar sugestão
+              {fieldBusy ? "A guardar..." : "Aceitar sugestão"}
             </button>
 
             <button
+                className="button-secondary"
                 type="button"
                 onClick={() => void reviewField(fieldName, "edit")}
                 disabled={fieldBusy || loading}
@@ -835,9 +1071,10 @@ function App() {
             </button>
 
             <button
+                className="button-quiet"
                 type="button"
                 onClick={() => void reviewField(fieldName, "reject")}
-                disabled={fieldBusy || loading}
+                disabled={fieldBusy || loading || field.status === "rejected"}
             >
               Rejeitar
             </button>
@@ -852,19 +1089,16 @@ function App() {
 
   return (
       <main className="page">
-
         {/* HEADER */}
 
         <header className="hero">
-          <p className="eyebrow">
-            AI DATASET CURATION
-          </p>
+          <p className="eyebrow">AI DATASET CURATION</p>
 
           <h1>Zenodo Metadata Assistant</h1>
 
           <p className="subtitle">
-            Transforma repositórios GitHub em metadados
-            estruturados para datasets de Machine Learning.
+            Transforma repositórios GitHub em metadados estruturados para
+            datasets de Machine Learning.
           </p>
         </header>
 
@@ -900,7 +1134,6 @@ function App() {
 
         <section className="panel">
           <form onSubmit={analyze}>
-
             <label htmlFor="repo-url">
               URL do repositório GitHub
             </label>
@@ -929,20 +1162,17 @@ function App() {
 
             <div className="form-footer">
               <p className="hint">
-                Primeiro analisamos o repositório.
-                Depois poderás escolher o dataset que pretendes utilizar.
+                Primeiro analisamos o repositório. Depois poderás escolher o
+                dataset que pretendes utilizar.
               </p>
 
               <button
                   type="submit"
                   disabled={loading || !url.trim()}
               >
-                {loading
-                    ? "A analisar..."
-                    : "Analisar repositório"}
+                {loading ? "A analisar..." : "Analisar repositório"}
               </button>
             </div>
-
           </form>
         </section>
 
@@ -966,16 +1196,12 @@ function App() {
         {analysis && (
             <>
               <section className="panel">
-
-                <p className="eyebrow">
-                  REPOSITÓRIO ANALISADO
-                </p>
+                <p className="eyebrow">REPOSITÓRIO ANALISADO</p>
 
                 <h2>{analysis.repository.full_name}</h2>
 
                 <p>
-                  {analysis.repository.description ||
-                      "Sem descrição no GitHub."}
+                  {analysis.repository.description || "Sem descrição no GitHub."}
                 </p>
 
                 <a
@@ -1000,13 +1226,11 @@ function App() {
                     {analysis.repository.license || "Não identificada"}
                   </strong>
                 </div>
-
               </section>
 
               {/* INVENTORY */}
 
               <section className="stats">
-
                 <article className="stat">
                   <strong>{analysis.inventory.total_files}</strong>
                   <span>Ficheiros</span>
@@ -1018,33 +1242,25 @@ function App() {
                 </article>
 
                 <article className="stat">
-                  <strong>
-                    {analysis.inventory.dataset_candidates_found}
-                  </strong>
+                  <strong>{analysis.inventory.dataset_candidates_found}</strong>
                   <span>Candidatos a datasets</span>
                 </article>
-
               </section>
 
               {/* DATASET SELECTION */}
 
               <section className="panel">
-
-                <p className="eyebrow">
-                  DATASET SELECTION
-                </p>
+                <p className="eyebrow">DATASET SELECTION</p>
 
                 <h2>Selecionar dataset</h2>
 
                 <p className="hint">
-                  Escolhe o ficheiro que pretendes inspecionar
-                  e utilizar para gerar os metadados Croissant.
+                  Escolhe o ficheiro que pretendes inspecionar e utilizar para
+                  gerar os metadados Croissant.
                 </p>
 
                 {analysis.dataset_candidates.length === 0 ? (
-                    <p>
-                      Não foram encontrados candidatos a datasets.
-                    </p>
+                    <p>Não foram encontrados candidatos a datasets.</p>
                 ) : (
                     <>
                       <label htmlFor="dataset-select">
@@ -1062,15 +1278,10 @@ function App() {
                           }}
                           disabled={loading}
                       >
-                        <option value="">
-                          Seleciona um ficheiro...
-                        </option>
+                        <option value="">Seleciona um ficheiro...</option>
 
                         {analysis.dataset_candidates.map((file) => (
-                            <option
-                                key={file.path}
-                                value={file.path}
-                            >
+                            <option key={file.path} value={file.path}>
                               {file.path} — {file.extension} —{" "}
                               {file.size.toLocaleString()} bytes
                             </option>
@@ -1087,9 +1298,7 @@ function App() {
                                 type="button"
                                 onClick={() => void extractDataset()}
                                 disabled={
-                                    loading ||
-                                    !ollamaAvailable ||
-                                    !modelInstalled
+                                    loading || !ollamaAvailable || !modelInstalled
                                 }
                             >
                               {loading
@@ -1107,7 +1316,6 @@ function App() {
                       )}
                     </>
                 )}
-
               </section>
 
               {/* ANALYSIS WARNINGS */}
@@ -1131,10 +1339,7 @@ function App() {
         {extraction && (
             <>
               <section className="panel">
-
-                <p className="eyebrow">
-                  DATASET INSPECTION
-                </p>
+                <p className="eyebrow">DATASET INSPECTION</p>
 
                 <h2>Inspeção do dataset</h2>
 
@@ -1145,9 +1350,7 @@ function App() {
 
                 <div className="details">
                   <span>Formato</span>
-                  <strong>
-                    {extraction.selected_dataset.format}
-                  </strong>
+                  <strong>{extraction.selected_dataset.format}</strong>
 
                   <span>Tamanho</span>
                   <strong>
@@ -1155,9 +1358,7 @@ function App() {
                   </strong>
 
                   <span>Codificação</span>
-                  <strong>
-                    {extraction.selected_dataset.encoding}
-                  </strong>
+                  <strong>{extraction.selected_dataset.encoding}</strong>
 
                   <span>Delimitador</span>
                   <strong>
@@ -1183,71 +1384,51 @@ function App() {
                         <strong>{column.name}</strong>
 
                         <span className="field-status">
-                    {column.inferred_type} ·{" "}
-                          {column.missing_values} valores em falta
+                    {column.inferred_type} · {column.missing_values} valores
+                    em falta
                   </span>
                       </li>
                   ))}
                 </ul>
-
               </section>
 
               {/* METADATA REVIEW */}
 
               <section className="panel">
-
-                <p className="eyebrow">
-                  HUMAN REVIEW
-                </p>
+                <p className="eyebrow">HUMAN REVIEW</p>
 
                 <h2>Revisão dos metadados</h2>
 
                 <p className="hint">
-                  A IA apresenta sugestões, mas és tu quem decide
-                  quais os valores que ficam confirmados.
-                  Podes aceitar, editar ou rejeitar cada campo.
+                  A IA apresenta sugestões, mas és tu quem decide quais os valores
+                  que ficam confirmados. Podes aceitar, editar ou rejeitar cada
+                  campo.
                 </p>
 
                 <p className="hint">
-                  Os campos assinalados com * são obrigatórios
-                  para gerar o Croissant nesta aplicação.
+                  Os campos assinalados com * são obrigatórios para gerar o
+                  Croissant nesta aplicação.
                 </p>
 
                 <div className="metadata-grid">
-
                   {renderMetadataField("title", true)}
-
                   {renderMetadataField("description", true)}
-
                   {renderMetadataField("creators", true)}
-
                   {renderMetadataField("license", true)}
-
                   {renderMetadataField("date_published", true)}
-
                   {renderMetadataField("dataset_type", true)}
-
                   {renderMetadataField("data_modality", true)}
-
                   {renderMetadataField("keywords")}
-
                   {renderMetadataField("machine_learning_task")}
-
                   {renderMetadataField("language")}
-
                   {renderMetadataField("number_of_records")}
-
                 </div>
-
               </section>
 
               {/* CONFIRMATION STATUS */}
 
               <section className="panel missing-panel">
-
-                <p className="eyebrow">
-                  CONFIRMATION STATUS
-                </p>
+                <p className="eyebrow">CONFIRMATION STATUS</p>
 
                 <h2>Estado da confirmação</h2>
 
@@ -1266,9 +1447,7 @@ function App() {
                     </p>
                 ) : (
                     <>
-                      <p>
-                        Ainda precisas de resolver os seguintes campos:
-                      </p>
+                      <p>Ainda precisas de resolver os seguintes campos:</p>
 
                       <ul>
                         {pendingFields.map((field) => (
@@ -1288,27 +1467,26 @@ function App() {
                         <p>
                           Campos rejeitados:{" "}
                           {confirmation.rejected_fields
-                              .map((field) => FIELD_LABELS[field as MetadataFieldName] || field)
+                              .map(
+                                  (field) =>
+                                      FIELD_LABELS[field as MetadataFieldName] || field,
+                              )
                               .join(", ")}
                         </p>
                     )}
-
               </section>
 
               {/* CROISSANT GENERATION */}
 
               <section className="panel">
-
-                <p className="eyebrow">
-                  CROISSANT GENERATION
-                </p>
+                <p className="eyebrow">CROISSANT GENERATION</p>
 
                 <h2>Gerar metadados Croissant</h2>
 
                 <p className="hint">
-                  O documento só pode ser gerado depois de confirmares
-                  os sete campos obrigatórios. O backend volta a inspecionar
-                  o dataset e valida o JSON-LD com mlcroissant.
+                  O documento só pode ser gerado depois de confirmares os sete
+                  campos obrigatórios. O backend volta a inspecionar o dataset e
+                  valida o JSON-LD com mlcroissant.
                 </p>
 
                 <button
@@ -1316,18 +1494,14 @@ function App() {
                     onClick={() => void generateCroissant()}
                     disabled={!canGenerateCroissant}
                 >
-                  {loading
-                      ? "A gerar Croissant..."
-                      : "Gerar Croissant"}
+                  {loading ? "A gerar Croissant..." : "Gerar Croissant"}
                 </button>
 
                 {!canGenerateCroissant && (
                     <p className="hint">
-                      Confirma todos os campos obrigatórios para ativar
-                      a geração.
+                      Confirma os sete campos obrigatórios para ativar a geração.
                     </p>
                 )}
-
               </section>
             </>
         )}
@@ -1336,10 +1510,7 @@ function App() {
 
         {croissant && (
             <section className="panel">
-
-              <p className="eyebrow">
-                CROISSANT GENERATED
-              </p>
+              <p className="eyebrow">CROISSANT GENERATED</p>
 
               <h2>Croissant gerado com sucesso</h2>
 
@@ -1379,10 +1550,8 @@ function App() {
               <pre className="croissant-preview">
             {JSON.stringify(croissant.croissant, null, 2)}
           </pre>
-
             </section>
         )}
-
       </main>
   );
 }

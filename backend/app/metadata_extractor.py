@@ -1,5 +1,6 @@
 
 from pathlib import Path
+from typing import Any
 
 from app.ollama_service import extract_with_ollama
 from app.metadata_schema import ExtractedMetadata, MetadataField
@@ -10,16 +11,17 @@ REQUIRED_FIELDS = [
     "description",
     "creators",
     "license",
+    "date_published",
     "dataset_type",
     "data_modality",
 ]
-
 
 FIELD_NAMES = [
     "title",
     "description",
     "creators",
     "license",
+    "date_published",
     "keywords",
     "dataset_type",
     "machine_learning_task",
@@ -29,8 +31,7 @@ FIELD_NAMES = [
 ]
 
 
-def has_value(value):
-    """Verifica se um valor está efetivamente preenchido."""
+def has_value(value: Any) -> bool:
     if value is None:
         return False
 
@@ -43,35 +44,28 @@ def has_value(value):
     return True
 
 
-def normalize_field(field):
-    """
-    Normaliza os campos recebidos do Ollama.
+def normalize_field(field: Any) -> MetadataField:
+    """Normaliza sugestões sem confirmar automaticamente os campos."""
 
-    Campos sem valor não podem manter fontes, evidências
-    ou confiança que sugiram que existe informação válida.
-
-    Todas as sugestões permanecem pendentes de confirmação.
-    """
     if field is None:
         return MetadataField()
 
     if not isinstance(field, MetadataField):
         field = MetadataField.model_validate(field)
 
-    # Compatibilidade com respostas antigas do Ollama.
+    # Compatibilidade com respostas antigas que só continham value.
     if field.suggested_value is None and field.value is not None:
         field.suggested_value = field.value
 
     if field.value is None and field.suggested_value is not None:
         field.value = field.suggested_value
 
-    # Determina o valor efetivamente sugerido.
-    effective_value = field.suggested_value
+    effective_value = (
+        field.suggested_value
+        if field.suggested_value is not None
+        else field.value
+    )
 
-    if effective_value is None:
-        effective_value = field.value
-
-    # Sem valor, não pode existir evidência associada.
     if not has_value(effective_value):
         field.suggested_value = None
         field.value = None
@@ -84,32 +78,28 @@ def normalize_field(field):
     return field
 
 
-def field_has_value(field):
-    """Verifica se um campo contém uma sugestão utilizável."""
+def field_has_value(field: MetadataField | None) -> bool:
     if field is None:
         return False
 
-    value = field.suggested_value
-
-    if value is None:
-        value = field.value
+    value = (
+        field.suggested_value
+        if field.suggested_value is not None
+        else field.value
+    )
 
     return has_value(value)
 
 
 def set_deterministic_suggestion(
         field: MetadataField,
-        value,
+        value: Any,
         source: str,
         evidence: str,
         confidence: float,
-):
-    """
-    Define uma sugestão baseada em informação técnica
-    diretamente disponível no backend.
+) -> None:
+    """Define uma sugestão baseada em evidência técnica do backend."""
 
-    Nunca confirma automaticamente o campo.
-    """
     field.suggested_value = value
     field.value = value
     field.source = source
@@ -119,23 +109,15 @@ def set_deterministic_suggestion(
 
 
 def generate_title_from_filename(dataset_path: str) -> str | None:
-    """
-    Converte o nome do ficheiro num título legível.
 
-    Exemplo:
-    iris.csv -> Iris dataset
-    """
     if not dataset_path:
         return None
 
-    filename = Path(dataset_path).name
-    stem = Path(filename).stem
+    stem = Path(dataset_path).stem
 
-    if not stem:
-        return None
-
-    words = stem.replace("_", " ").replace("-", " ")
-    words = " ".join(words.split())
+    words = " ".join(
+        stem.replace("_", " ").replace("-", " ").split()
+    )
 
     if not words:
         return None
@@ -151,59 +133,58 @@ def generate_title_from_filename(dataset_path: str) -> str | None:
 def apply_deterministic_metadata(
         metadata: ExtractedMetadata,
         dataset_inspection: dict | None,
-):
-    """
-    Preenche informações técnicas que podem ser obtidas
-    diretamente da inspeção do dataset.
-    """
+) -> ExtractedMetadata:
+    """Preenche características verificáveis do dataset selecionado."""
+
     if not dataset_inspection:
         return metadata
 
-    dataset_path = dataset_inspection.get("path", "")
+    dataset_path = str(dataset_inspection.get("path") or "")
 
-    dataset_format = (
-            dataset_inspection.get("format")
-            or Path(dataset_path).suffix
+    dataset_format = str(
+        dataset_inspection.get("format")
+        or Path(dataset_path).suffix
     ).lower()
 
-    columns = dataset_inspection.get("columns", [])
+    columns = dataset_inspection.get("columns") or []
 
     # 1. TITLE
     if not field_has_value(metadata.title):
+
         title = generate_title_from_filename(dataset_path)
 
         if title:
             set_deterministic_suggestion(
-                field=metadata.title,
-                value=title,
-                source="filename",
-                evidence=dataset_path,
-                confidence=0.8,
+                metadata.title,
+                title,
+                "filename",
+                dataset_path,
+                0.8,
             )
 
     # 2. DATASET TYPE E DATA MODALITY
-    if dataset_format in [".csv", ".tsv"] and columns:
+    if dataset_format in {".csv", ".tsv", "csv", "tsv"} and columns:
 
-        set_deterministic_suggestion(
-            field=metadata.dataset_type,
-            value="Tabular dataset",
-            source="selected_dataset_inspection",
-            evidence=(
-                f"Formato {dataset_format} com "
-                f"{len(columns)} colunas inspecionadas."
-            ),
-            confidence=1.0,
+        evidence = (
+            f"Ficheiro selecionado {dataset_path}; "
+            f"formato {dataset_format}; "
+            f"{len(columns)} colunas identificadas na inspeção."
         )
 
         set_deterministic_suggestion(
-            field=metadata.data_modality,
-            value="Tabular",
-            source="selected_dataset_inspection",
-            evidence=(
-                f"Formato {dataset_format} com "
-                f"{len(columns)} colunas inspecionadas."
-            ),
-            confidence=1.0,
+            metadata.dataset_type,
+            "Tabular dataset",
+            "selected_dataset_inspection",
+            evidence,
+            1.0,
+        )
+
+        set_deterministic_suggestion(
+            metadata.data_modality,
+            "Tabular",
+            "selected_dataset_inspection",
+            evidence,
+            1.0,
         )
 
     # 3. NUMBER OF RECORDS
@@ -212,12 +193,16 @@ def apply_deterministic_metadata(
     )
 
     if number_of_records is not None:
+
         set_deterministic_suggestion(
-            field=metadata.number_of_records,
-            value=number_of_records,
-            source="selected_dataset_inspection",
-            evidence=f"number_of_records: {number_of_records}",
-            confidence=1.0,
+            metadata.number_of_records,
+            number_of_records,
+            "selected_dataset_inspection",
+            (
+                f"Contagem indicada pela inspeção de "
+                f"{dataset_path}: {number_of_records}."
+            ),
+            1.0,
         )
 
     return metadata
@@ -238,12 +223,13 @@ async def extract_repository_metadata(
 
     # 2. Normalização de todos os campos.
     for field_name in FIELD_NAMES:
-        field = getattr(metadata, field_name)
 
         setattr(
             metadata,
             field_name,
-            normalize_field(field),
+            normalize_field(
+                getattr(metadata, field_name, None)
+            ),
         )
 
     metadata.additional_information = [
@@ -258,13 +244,14 @@ async def extract_repository_metadata(
     )
 
     # 4. Identificação dos campos obrigatórios em falta.
-    missing = set()
+    missing = []
 
     for field_name in REQUIRED_FIELDS:
-        field = getattr(metadata, field_name)
+
+        field = getattr(metadata, field_name, None)
 
         if not field_has_value(field):
-            missing.add(field_name)
+            missing.append(field_name)
 
     metadata.missing_information = sorted(missing)
 

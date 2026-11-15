@@ -20,6 +20,13 @@ from app.metadata_validation import (
     validate_metadata_field,
 )
 
+from app.ror_service import (
+    RORInvalidIDError,
+    RORNotFoundError,
+    RORServiceError,
+    validate_ror_id,
+)
+
 
 # ============================================================
 # CAMPOS OBRIGATÓRIOS
@@ -179,6 +186,132 @@ def _validate_creator_identities(
 
 
 # ============================================================
+# VALIDAR ORGANIZAÇÕES NA API OFICIAL ROR
+# ============================================================
+
+async def _verify_ror_organizations(
+        creators: list[CreatorIdentity],
+) -> list[CreatorIdentity]:
+    """
+    Confirma a existência de cada ROR na API oficial.
+
+    O nome devolvido pelo registo ROR passa a ser a designação canónica
+    utilizada no metadado. Não se confia apenas no formato do identificador.
+    """
+
+    for index, creator in enumerate(creators, start=1):
+
+        if creator.creator_type != "organization":
+            continue
+
+        if not creator.ror_id:
+
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "Uma organização necessita de um ROR ID.",
+                    "creator": index,
+                },
+            )
+
+        try:
+
+            verified = await validate_ror_id(
+                creator.ror_id
+            )
+
+        except RORInvalidIDError as exc:
+
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "O formato do ROR ID é inválido.",
+                    "creator": index,
+                },
+            ) from exc
+
+        except RORNotFoundError as exc:
+
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "O ROR ID não existe no registo oficial.",
+                    "creator": index,
+                    "ror_id": creator.ror_id,
+                },
+            ) from exc
+
+        except RORServiceError as exc:
+
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Não foi possível verificar o ROR na API oficial. "
+                    "Tenta novamente mais tarde."
+                ),
+            ) from exc
+
+        # Utilizar o nome oficial do registo ROR.
+        creator.name = verified["name"]
+
+    return creators
+
+
+# ============================================================
+# EXIGIR AUTENTICAÇÃO PARA TODAS AS PESSOAS
+# ============================================================
+
+def _require_authenticated_people(
+        creators: list[CreatorIdentity],
+        authenticated_creator: dict[str, str] | None,
+) -> list[CreatorIdentity]:
+    """
+    Não aceita ORCID introduzido manualmente como prova de identidade.
+    Esta versão suporta uma pessoa autenticada por sessão e várias organizações.
+    """
+
+    people = [
+        creator for creator in creators
+        if creator.creator_type == "person"
+    ]
+
+    if not people:
+        return creators
+
+    if not authenticated_creator:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Cada pessoa indicada como criador tem de autenticar a sua "
+                "identidade através da ORCID. Um ORCID escrito manualmente "
+                "não é suficiente."
+            ),
+        )
+
+    trusted_orcid = authenticated_creator.get("orcid")
+    if not trusted_orcid:
+        trusted_orcid = authenticated_creator.get("orcid_id")
+
+    if len(people) != 1 or people[0].orcid_id != trusted_orcid:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "A sessão ORCID atual só pode confirmar a pessoa autenticada. "
+                "Para esta versão, adiciona no máximo um investigador; podes "
+                "adicionar várias organizações através de ROR."
+            ),
+        )
+
+    # Substituir o nome e identificador pelos dados devolvidos pela sessão confiável.
+    trusted_identity = CreatorIdentity.model_validate(authenticated_creator)
+    for index, creator in enumerate(creators):
+        if creator.creator_type == "person":
+            creators[index] = trusted_identity
+
+    return creators
+
+
+# ============================================================
 # INCLUIR O UTILIZADOR AUTENTICADO
 # ============================================================
 
@@ -272,7 +405,7 @@ def _merge_authenticated_creator(
 # APLICAR REVISÕES
 # ============================================================
 
-def apply_metadata_reviews(
+async def apply_metadata_reviews(
         request: ConfirmMetadataRequest,
 ) -> ConfirmedMetadataResponse:
 
@@ -317,18 +450,52 @@ def apply_metadata_reviews(
         )
 
         # Se o cliente já enviou creators como confirmed,
-        # também garantimos que a identidade autenticada está presente.
+        # garantimos que a identidade autenticada está presente.
 
         if creators_field.status == "confirmed":
 
             creators_field.value = (
-                _validate_creator_identities(
-                    _merge_authenticated_creator(
-                        creators_field.value,
-                        authenticated_creator,
-                    )
+                _merge_authenticated_creator(
+                    creators_field.value,
+                    authenticated_creator,
                 )
             )
+
+    # ========================================================
+    # 1A. VALIDAR CRIADORES JÁ CONFIRMADOS
+    # ========================================================
+
+    # Também verificamos ROR quando o pedido não inclui uma revisão
+    # explícita de creators. Assim, não é possível contornar a consulta
+    # ao registo oficial enviando o campo já marcado como confirmed.
+
+    creators_field = metadata.creators
+
+    if (
+            creators_field.status == "confirmed"
+            and "creators" not in request.reviews
+    ):
+
+        creators_to_verify = creators_field.value
+
+        if authenticated_creator:
+
+            creators_to_verify = _merge_authenticated_creator(
+                creators_to_verify,
+                authenticated_creator,
+            )
+
+        creators_to_verify = _validate_creator_identities(
+            creators_to_verify
+        )
+        creators_to_verify = _require_authenticated_people(
+            creators_to_verify,
+            authenticated_creator,
+        )
+
+        creators_field.value = await _verify_ror_organizations(
+            creators_to_verify
+        )
 
     # ========================================================
     # 2. PROCESSAR AS REVISÕES
@@ -488,6 +655,16 @@ def apply_metadata_reviews(
 
             value_to_validate = (
                 _validate_creator_identities(
+                    value_to_validate
+                )
+            )
+            value_to_validate = _require_authenticated_people(
+                value_to_validate,
+                authenticated_creator,
+            )
+
+            value_to_validate = (
+                await _verify_ror_organizations(
                     value_to_validate
                 )
             )
