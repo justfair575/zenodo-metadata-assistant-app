@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 
@@ -31,6 +31,7 @@ from app.ollama_service import (
 from app.metadata_schema import (
     ConfirmMetadataRequest,
     ConfirmedMetadataResponse,
+    CreatorIdentity,
     ExtractedMetadata,
 )
 
@@ -43,6 +44,14 @@ from app.orcid_service import (
     create_orcid_authorization_url,
     consume_orcid_state,
     exchange_orcid_authorization_code,
+)
+
+from app.ror_service import (
+    RORInvalidIDError,
+    RORNotFoundError,
+    RORServiceError,
+    search_organizations,
+    validate_ror_id,
 )
 
 
@@ -90,7 +99,6 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-
     return {
         "status": "ok",
     }
@@ -104,7 +112,6 @@ async def health():
 async def ollama_status():
 
     try:
-
         async with httpx.AsyncClient(
                 timeout=5,
         ) as client:
@@ -114,7 +121,6 @@ async def ollama_status():
             )
 
             response.raise_for_status()
-
             data = response.json()
 
             models = [
@@ -138,7 +144,6 @@ async def ollama_status():
             }
 
     except Exception:
-
         return {
             "available": False,
             "configured_model": OLLAMA_MODEL,
@@ -155,7 +160,6 @@ async def ollama_status():
 async def analyze_repository(
         request: AnalyzeRequest,
 ):
-
     return await analyze_github_repository(request)
 
 
@@ -268,8 +272,7 @@ async def extract_dataset_metadata(
 async def confirm_metadata(
         request: ConfirmMetadataRequest,
 ):
-
-    return apply_metadata_reviews(request)
+    return await apply_metadata_reviews(request)
 
 
 # ============================================================
@@ -320,15 +323,31 @@ async def generate_croissant_endpoint(
         # Validar novamente no endpoint de geração.
         # Assim, um pedido direto à API não consegue contornar
         # as regras aplicadas durante a revisão dos metadados.
+
+        validation_value = field.value
+
+        # ExtractedMetadata converte os criadores em CreatorIdentity.
+        # O validador genérico trabalha com dicionários, por isso
+        # convertemos os objetos antes de validar o campo creators.
+
+        if field_name == "creators" and isinstance(field.value, list):
+            validation_value = [
+                item.model_dump(exclude_none=True)
+                if isinstance(item, CreatorIdentity)
+                else item
+                for item in field.value
+            ]
+
         errors = validate_metadata_field(
             field_name,
-            field.value,
+            validation_value,
         )
 
         if errors:
             field_errors[field_name] = errors
 
     if pending_fields or field_errors:
+
         detail = {
             "message": (
                 "Não é possível gerar o Croissant. "
@@ -346,6 +365,53 @@ async def generate_croissant_endpoint(
             status_code=422,
             detail=detail,
         )
+
+    # 1A. Revalidar os identificadores ROR no registo oficial.
+    # A confirmação anterior não deve ser contornável por um pedido
+    # direto ao endpoint de geração com metadata marcada como confirmed.
+
+    creators_field = request.metadata.creators
+
+    for index, creator in enumerate(creators_field.value, start=1):
+
+        if creator.creator_type != "organization":
+            continue
+
+        try:
+            verified_organization = await validate_ror_id(
+                creator.ror_id
+            )
+
+        except RORInvalidIDError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "O formato do ROR ID é inválido.",
+                    "creator": index,
+                },
+            ) from exc
+
+        except RORNotFoundError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "O ROR ID não existe no registo oficial.",
+                    "creator": index,
+                    "ror_id": creator.ror_id,
+                },
+            ) from exc
+
+        except RORServiceError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Não foi possível verificar o ROR na API oficial. "
+                    "Tenta novamente mais tarde."
+                ),
+            ) from exc
+
+        # O nome oficial do registo é a designação canónica no Croissant.
+        creator.name = verified_organization["name"]
 
     # 2. Analisar novamente o repositório.
 
@@ -400,7 +466,6 @@ async def generate_croissant_endpoint(
     # 6. Confirmar o formato da resposta.
 
     if content.get("encoding") != "base64":
-
         raise HTTPException(
             status_code=422,
             detail=(
@@ -412,7 +477,6 @@ async def generate_croissant_endpoint(
     # 7. Descodificar o conteúdo.
 
     try:
-
         encoded = "".join(
             content.get("content", "").split()
         )
@@ -426,7 +490,6 @@ async def generate_croissant_endpoint(
             ValueError,
             binascii.Error,
     ) as exc:
-
         raise HTTPException(
             status_code=422,
             detail=(
@@ -438,7 +501,6 @@ async def generate_croissant_endpoint(
     # 8. Confirmar o limite de inspeção.
 
     if len(raw) > 1_000_000:
-
         raise HTTPException(
             status_code=413,
             detail=(
@@ -487,13 +549,11 @@ async def generate_croissant_endpoint(
         ).resolve()
 
         try:
-
             local_dataset.relative_to(
                 dataset_directory
             )
 
         except ValueError as exc:
-
             raise HTTPException(
                 status_code=422,
                 detail="Caminho do dataset fora da pasta temporária.",
@@ -540,6 +600,7 @@ async def generate_croissant_endpoint(
             "croissant": croissant,
         }
 
+
 # ============================================================
 # ORCID OAUTH
 # ============================================================
@@ -549,6 +610,7 @@ async def orcid_authorize():
     """Inicia a autenticação ORCID e redireciona para o Sandbox."""
 
     authorization_url = create_orcid_authorization_url()
+
     return RedirectResponse(
         url=authorization_url,
         status_code=302,
@@ -566,6 +628,7 @@ async def orcid_callback(
     if error:
         if state:
             consume_orcid_state(state)
+
         raise HTTPException(
             status_code=400,
             detail="A autorização ORCID foi cancelada ou recusada.",
@@ -582,11 +645,13 @@ async def orcid_callback(
             code=code,
             state=state,
         )
+
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
             detail=str(exc),
         ) from exc
+
     except RuntimeError as exc:
         raise HTTPException(
             status_code=502,
@@ -604,10 +669,85 @@ async def orcid_callback(
             "name": result["name"],
             "orcid_id": result["orcid"],
         },
-        # Token opaco da Zenodo Metadata App. Deve ser enviado no corpo
-        # de /api/v1/metadata/confirm e mantido apenas em memória no frontend.
+        # Token opaco da Zenodo Metadata App.
         # Não é o access token OAuth da ORCID.
         "creator_session_token": result["creator_session_token"],
         "scope": result.get("scope"),
     }
 
+
+# ============================================================
+# ROR — PESQUISAR ORGANIZAÇÕES
+# ============================================================
+
+@app.get("/api/v1/ror/search")
+async def search_ror_organizations(
+        query: str = Query(
+            ...,
+            min_length=2,
+            max_length=200,
+            description="Nome ou parte do nome da organização.",
+        ),
+        page: int = Query(
+            1,
+            ge=1,
+            le=500,
+        ),
+):
+    """Pesquisa organizações no registo público ROR."""
+
+    try:
+        return await search_organizations(
+            query=query,
+            page=page,
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        ) from exc
+
+    except RORServiceError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Não foi possível consultar o registo ROR. "
+                "Tenta novamente mais tarde."
+            ),
+        ) from exc
+
+
+# ============================================================
+# ROR — VALIDAR IDENTIFICADOR
+# ============================================================
+
+@app.get("/api/v1/ror/validate/{ror_id}")
+async def validate_ror_organization(
+        ror_id: str,
+):
+    """Confirma que o ROR iD corresponde a um registo existente."""
+
+    try:
+        return await validate_ror_id(ror_id)
+
+    except RORInvalidIDError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        ) from exc
+
+    except RORNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail="O ROR iD não existe no registo ROR.",
+        ) from exc
+
+    except RORServiceError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Não foi possível consultar o registo ROR. "
+                "Tenta novamente mais tarde."
+            ),
+        ) from exc
