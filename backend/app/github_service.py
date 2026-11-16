@@ -18,12 +18,64 @@ GITHUB_API = "https://api.github.com"
 MAX_METADATA_FILES = 20
 MAX_METADATA_FILE_BYTES = 200_000
 MAX_TOTAL_METADATA_BYTES = 1_000_000
+DOCUMENTATION_EXTENSIONS = {
+    ".adoc",
+    ".cff",
+    ".html",
+    ".json",
+    ".md",
+    ".mdx",
+    ".org",
+    ".rst",
+    ".text",
+    ".toml",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".jsonld",
+}
+DOCUMENTATION_DIRECTORIES = {
+    "data",
+    "dataset",
+    "datasets",
+    "doc",
+    "docs",
+    "documentation",
+    "metadata",
+}
+DOCUMENTATION_NAME_HINTS = (
+    "about",
+    "author",
+    "citation",
+    "codemeta",
+    "croissant",
+    "config",
+    "datacite",
+    "datapackage",
+    "data-card",
+    "data-dict",
+    "data-dictionary",
+    "dataset",
+    "dataset-card",
+    "dataset-info",
+    "dataset-metadata",
+    "dataset-schema",
+    "description",
+    "info",
+    "metadata",
+    "readme",
+    "schema",
+    "ro-crate",
+)
 
 MAX_DATASET_CANDIDATES = 100
 MAX_DATASET_FILE_BYTES = 100_000_000
 
-# Limite específico para inspeção de CSV/TSV.
-MAX_INSPECTION_FILE_BYTES = 1_000_000
+# Limite específico para inspeção de CSV/TSV. Ficheiros maiores que o
+# limite inline da API Contents são lidos do URL raw do commit.
+MAX_INSPECTION_FILE_BYTES = 25_000_000
+GITHUB_CONTENTS_INLINE_LIMIT = 1_000_000
 
 MAX_SAMPLE_ROWS = 5
 MAX_TYPE_INFERENCE_ROWS = 1000
@@ -49,12 +101,103 @@ METADATA_NAMES = {
     "pyproject.toml",
     "package.json",
     "dataset-metadata.json",
+    "data_dictionary.md",
+    "data-dictionary.md",
+    "data_dictionary.rst",
+    "data-dictionary.rst",
     "dataset_info.json",
     "dataset_infos.json",
     "metadata.json",
     "datacard.md",
     "dataset_card.md",
 }
+
+
+def metadata_candidate_score(
+        item: dict,
+        dataset_path: str | None = None,
+) -> int | None:
+    """Rank documentation likely to describe a repository or selected dataset."""
+
+    path = item.get("path")
+    if not isinstance(path, str):
+        return None
+
+    parts = path.lower().split("/")
+    filename = parts[-1]
+    stem, extension = os.path.splitext(filename)
+    normalized_stem = re.sub(r"[^a-z0-9]", "", stem)
+    directories = set(parts[:-1])
+    is_readme = stem.startswith("readme")
+    is_known_name = filename in METADATA_NAMES or any(
+        normalized_stem == re.sub(r"[^a-z0-9]", "", os.path.splitext(name)[0])
+        for name in METADATA_NAMES
+    )
+    has_name_hint = any(
+        re.sub(r"[^a-z0-9]", "", hint) in normalized_stem
+        for hint in DOCUMENTATION_NAME_HINTS
+    )
+    in_documentation_directory = bool(
+        directories.intersection(DOCUMENTATION_DIRECTORIES)
+    )
+    in_structured_metadata_directory = bool(
+        directories.intersection(
+            DOCUMENTATION_DIRECTORIES - {"data"}
+        )
+    )
+    is_text_document = extension in DOCUMENTATION_EXTENSIONS
+    root_text_document = (
+        len(parts) == 1
+        and extension in {".adoc", ".md", ".mdx", ".org", ".rst", ".text", ".txt"}
+    )
+    if not (
+        is_readme
+        or is_known_name
+        or has_name_hint
+        or (
+            is_text_document
+            and (in_documentation_directory or root_text_document)
+        )
+    ):
+        return None
+    if not is_text_document and not (is_known_name or has_name_hint):
+        return None
+    if (
+        extension in {".json", ".jsonld", ".toml", ".xml", ".yaml", ".yml"}
+        and not (
+            is_known_name
+            or has_name_hint
+            or in_structured_metadata_directory
+        )
+    ):
+        return None
+
+    score = 0
+    if is_readme:
+        score += 100
+    elif filename.startswith(("citation.", "codemeta.", "dataset-", "metadata.")):
+        score += 80
+    elif is_known_name or has_name_hint:
+        score += 60
+    if in_documentation_directory:
+        score += 20
+    if len(parts) == 1:
+        score += 15
+    elif directories.intersection({"docs", "documentation", "metadata", "dataset", "datasets"}):
+        score += 8
+    if extension in {".json", ".yaml", ".yml", ".toml", ".cff"}:
+        score += 5
+
+    if dataset_path:
+        dataset_parts = dataset_path.lower().split("/")[:-1]
+        shared_directories = 0
+        for candidate_part, dataset_part in zip(parts[:-1], dataset_parts):
+            if candidate_part != dataset_part:
+                break
+            shared_directories += 1
+        score += shared_directories * 12
+
+    return score
 
 DATA_EXTENSIONS = {
     ".csv",
@@ -329,11 +472,21 @@ async def analyze_github_repository(
                 "A árvore foi truncada pelo GitHub."
             )
 
+        dataset_path = getattr(request, "dataset_path", None)
+        metadata_candidates = sorted(
+            (
+                (metadata_candidate_score(item, dataset_path), item)
+                for item in files
+            ),
+            key=lambda candidate: (
+                -(candidate[0] or 0),
+                candidate[1]["path"].lower(),
+            ),
+        )
         metadata_candidates = [
             item
-            for item in files
-            if item["path"].split("/")[-1].lower()
-               in METADATA_NAMES
+            for score, item in metadata_candidates
+            if score is not None
         ][:MAX_METADATA_FILES]
 
         all_dataset_candidates = [
@@ -583,47 +736,84 @@ async def inspect_dataset_in_repository(
     commit_sha = repository_data["repository"]["commit_sha"]
 
     async with httpx.AsyncClient(
-            timeout=httpx.Timeout(30, connect=5),
+            timeout=httpx.Timeout(60, connect=5),
             follow_redirects=False,
     ) as client:
 
-        content = await github_get(
-            client,
-            f"/repos/{owner_path}/{repo_path}/contents/"
-            f"{quote(request.dataset_path, safe='/')}",
-            params={"ref": commit_sha},
-        )
+        if dataset["size"] > GITHUB_CONTENTS_INLINE_LIMIT:
+            raw_url = (
+                "https://raw.githubusercontent.com/"
+                f"{owner_path}/{repo_path}/"
+                f"{quote(commit_sha, safe='')}/"
+                f"{quote(request.dataset_path, safe='/')}"
+            )
 
-    if content.get("encoding") != "base64":
-        raise HTTPException(
-            422,
-            "O GitHub não disponibilizou o ficheiro "
-            "num formato de texto suportado.",
-        )
+            try:
+                async with client.stream("GET", raw_url) as response:
+                    if response.status_code == 404:
+                        raise HTTPException(
+                            404,
+                            "O ficheiro não foi encontrado no commit selecionado.",
+                        )
+                    if not response.is_success:
+                        raise HTTPException(
+                            502,
+                            f"Erro ao descarregar o ficheiro: HTTP {response.status_code}.",
+                        )
 
-    try:
-        encoded = "".join(
-            content.get("content", "").split()
-        )
+                    raw = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        if len(raw) + len(chunk) > MAX_INSPECTION_FILE_BYTES:
+                            raise HTTPException(
+                                413,
+                                "O ficheiro ultrapassa o limite de "
+                                "25 MB para inspeção nesta versão.",
+                            )
+                        raw.extend(chunk)
 
-        raw = base64.b64decode(
-            encoded,
-            validate=True,
-        )
+            except httpx.RequestError as exc:
+                raise HTTPException(
+                    502,
+                    "Não foi possível descarregar o ficheiro do GitHub.",
+                ) from exc
+        else:
+            content = await github_get(
+                client,
+                f"/repos/{owner_path}/{repo_path}/contents/"
+                f"{quote(request.dataset_path, safe='/')}",
+                params={"ref": commit_sha},
+            )
 
-    except (
-            ValueError,
-            binascii.Error,
-    ) as exc:
-        raise HTTPException(
-            422,
-            "Não foi possível descodificar o ficheiro.",
-        ) from exc
+            if content.get("encoding") != "base64":
+                raise HTTPException(
+                    422,
+                    "O GitHub não disponibilizou o ficheiro "
+                    "num formato de texto suportado.",
+                )
+
+            try:
+                encoded = "".join(
+                    content.get("content", "").split()
+                )
+
+                raw = base64.b64decode(
+                    encoded,
+                    validate=True,
+                )
+
+            except (
+                    ValueError,
+                    binascii.Error,
+            ) as exc:
+                raise HTTPException(
+                    422,
+                    "Não foi possível descodificar o ficheiro.",
+                ) from exc
 
     if len(raw) > MAX_INSPECTION_FILE_BYTES:
         raise HTTPException(
             413,
-            "O ficheiro ultrapassa o limite de inspeção.",
+            "O ficheiro ultrapassa o limite de 25 MB para inspeção.",
         )
 
     try:

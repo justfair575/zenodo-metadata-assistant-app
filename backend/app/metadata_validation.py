@@ -57,6 +57,21 @@ DATASET_TYPES = {
     "other",
 }
 
+MACHINE_LEARNING_TASKS = {
+    "binary classification",
+    "multiclass classification",
+    "text classification",
+    "image classification",
+    "regression",
+    "clustering",
+    "anomaly detection",
+    "ranking",
+    "recommendation",
+    "forecasting",
+    "object detection",
+}
+
+
 DATA_MODALITIES = {
     "tabular",
     "image",
@@ -393,11 +408,35 @@ def validate_metadata_field(
         return validate_number_of_records(value)
 
     if field_name == "machine_learning_task":
-        return validate_text(
-            value,
-            "Tarefa de machine learning",
-            2,
-            200,
-        )
+        # Compatibilidade: versões anteriores enviavam uma única string.
+        if isinstance(value, str):
+            value = [value]
+
+        if not isinstance(value, list):
+            return ["As tarefas de machine learning têm de ser uma lista."]
+
+        if len(value) > len(MACHINE_LEARNING_TASKS):
+            return ["Foi indicado um número excessivo de tarefas."]
+
+        errors = []
+        seen = set()
+
+        for index, task in enumerate(value, start=1):
+            if not isinstance(task, str):
+                errors.append(f"Tarefa {index}: tem de ser texto.")
+                continue
+
+            normalized = task.strip().lower()
+            if normalized not in MACHINE_LEARNING_TASKS:
+                errors.append(
+                    f"Tarefa '{task}' não reconhecida. "
+                    "Seleciona uma das tarefas disponíveis."
+                )
+            elif normalized in seen:
+                errors.append(f"A tarefa '{task}' está repetida.")
+            else:
+                seen.add(normalized)
+
+        return errors
 
     return []

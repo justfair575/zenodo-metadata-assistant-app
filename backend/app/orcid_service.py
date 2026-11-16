@@ -14,7 +14,7 @@ import secrets
 import time
 
 from typing import Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 import httpx
 
@@ -36,7 +36,7 @@ ORCID_CLIENT_SECRET = os.getenv(
 
 ORCID_API_BASE_URL = os.getenv(
     "ORCID_API_BASE_URL",
-    "https://sandbox.orcid.org",
+    "https://orcid.org",
 ).strip().rstrip("/")
 
 ORCID_REDIRECT_URI = os.getenv(
@@ -69,6 +69,159 @@ _AUTHENTICATED_CREATOR_SESSIONS: dict[
     str,
     dict[str, Any],
 ] = {}
+
+_PUBLIC_API_ACCESS_TOKEN: str | None = None
+_PUBLIC_API_TOKEN_EXPIRES_AT = 0.0
+
+
+class ORCIDServiceError(Exception):
+    """Erro geral na comunicação com o registo público ORCID."""
+
+
+class ORCIDNotFoundError(ORCIDServiceError):
+    """O ORCID iD não foi encontrado."""
+
+
+class ORCIDInvalidIDError(ORCIDServiceError):
+    """O formato ou checksum do ORCID iD é inválido."""
+
+
+class ORCIDNameUnavailableError(ORCIDServiceError):
+    """O registo existe, mas não disponibiliza um nome público."""
+
+
+def _public_api_base_url() -> str:
+    if ORCID_API_BASE_URL == "https://sandbox.orcid.org":
+        return "https://pub.sandbox.orcid.org"
+    return "https://pub.orcid.org"
+
+
+async def _get_public_api_access_token(
+        client: httpx.AsyncClient,
+) -> str:
+    global _PUBLIC_API_ACCESS_TOKEN
+    global _PUBLIC_API_TOKEN_EXPIRES_AT
+
+    if (
+            _PUBLIC_API_ACCESS_TOKEN
+            and _PUBLIC_API_TOKEN_EXPIRES_AT > time.time()
+    ):
+        return _PUBLIC_API_ACCESS_TOKEN
+
+    if not ORCID_CLIENT_ID or not ORCID_CLIENT_SECRET:
+        raise ORCIDServiceError(
+            "As credenciais da aplicação ORCID não estão configuradas."
+        )
+
+    try:
+        response = await client.post(
+            f"{ORCID_API_BASE_URL}/oauth/token",
+            data={
+                "client_id": ORCID_CLIENT_ID,
+                "client_secret": ORCID_CLIENT_SECRET,
+                "grant_type": "client_credentials",
+                "scope": "/read-public",
+            },
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        response.raise_for_status()
+        token_data = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise ORCIDServiceError(
+            "Não foi possível obter acesso de leitura pública à API ORCID."
+        ) from exc
+
+    if not isinstance(token_data, dict):
+        raise ORCIDServiceError(
+            "A API ORCID devolveu uma resposta de token inválida."
+        )
+
+    access_token = token_data.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        raise ORCIDServiceError(
+            "A API ORCID não devolveu um token de leitura pública válido."
+        )
+
+    try:
+        expires_in = int(token_data.get("expires_in", 0))
+    except (TypeError, ValueError) as exc:
+        raise ORCIDServiceError(
+            "A API ORCID devolveu um prazo de token inválido."
+        ) from exc
+
+    if expires_in <= 0:
+        raise ORCIDServiceError(
+            "A API ORCID devolveu um prazo de token inválido."
+        )
+
+    _PUBLIC_API_ACCESS_TOKEN = access_token
+    _PUBLIC_API_TOKEN_EXPIRES_AT = time.time() + max(expires_in - 60, 0)
+    return access_token
+
+
+async def get_public_orcid_identity(
+        orcid_id: str,
+) -> dict[str, str]:
+    """Obtém o identificador e o nome visível publicamente no registo ORCID."""
+
+    if not isinstance(orcid_id, str):
+        raise ORCIDInvalidIDError("O ORCID iD tem de ser texto.")
+
+    normalized_orcid = normalize_orcid(orcid_id)
+    if not is_valid_orcid(normalized_orcid):
+        raise ORCIDInvalidIDError("O formato ou checksum do ORCID iD é inválido.")
+
+    url = (
+        f"{_public_api_base_url()}/v3.0/"
+        f"{quote(normalized_orcid, safe='')}/person"
+    )
+
+    try:
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(15.0, connect=5.0),
+                follow_redirects=False,
+        ) as client:
+            access_token = await _get_public_api_access_token(client)
+            response = await client.get(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "Zenodo-Metadata-Assistant",
+                    "Authorization": f"Bearer {access_token}",
+                },
+            )
+
+        if response.status_code == 404:
+            raise ORCIDNotFoundError("O ORCID iD não foi encontrado no registo.")
+
+        response.raise_for_status()
+        person = response.json()
+        if not isinstance(person, dict):
+            raise ORCIDServiceError("A API ORCID devolveu uma resposta inválida.")
+
+    except ORCIDServiceError:
+        raise
+    except httpx.HTTPStatusError as exc:
+        raise ORCIDServiceError("A API ORCID devolveu um erro HTTP.") from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise ORCIDServiceError("Não foi possível comunicar com a API ORCID.") from exc
+
+    name = _name_from_person_record(person)
+    if not name:
+        raise ORCIDNameUnavailableError(
+            "O registo ORCID existe, mas não disponibiliza um nome público."
+        )
+
+    return {
+        "valid": True,
+        "exists": True,
+        "orcid_id": normalized_orcid,
+        "orcid_url": f"https://orcid.org/{normalized_orcid}",
+        "name": name,
+    }
 
 
 # ============================================================

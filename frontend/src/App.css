@@ -749,3 +749,60 @@ a {
     flex-direction: column;
   }
 }
+
+/* =========================================================
+   MACHINE LEARNING TASK CHECKBOXES
+   ========================================================= */
+
+.task-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.task-editor-title {
+  color: #31453d;
+  font-size: 0.9rem;
+  font-weight: 750;
+}
+
+.task-checkbox-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px 12px;
+  padding: 14px;
+  border: 1px solid #dce7e1;
+  border-radius: 12px;
+  background: #fbfdfc;
+}
+
+.task-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  margin: 0;
+  padding: 7px 5px;
+  color: #31453d;
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.task-checkbox input {
+  flex: 0 0 auto;
+  width: 17px;
+  height: 17px;
+  margin: 0;
+  accent-color: #236e55;
+}
+
+.task-checkbox span {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 560px) {
+  .task-checkbox-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

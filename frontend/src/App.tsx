@@ -13,19 +13,19 @@ type CreatorIdentity = {
   ror_id?: string | null;
 };
 
-type OrcidPopupMessage = {
-  source: "zenodo-metadata-orcid";
-  status: "authenticated" | "error";
-  creator?: CreatorIdentity;
-  creator_session_token?: string;
-  message?: string;
-};
-
 type RorValidation = {
   valid: boolean;
   exists: boolean;
   ror_id: string;
   ror_url: string;
+  name: string;
+};
+
+type OrcidValidation = {
+  valid: boolean;
+  exists: boolean;
+  orcid_id: string;
+  orcid_url: string;
   name: string;
 };
 
@@ -155,6 +155,37 @@ const REQUIRED_FIELDS: MetadataFieldName[] = [
   "data_modality",
 ];
 
+const MACHINE_LEARNING_TASKS = [
+  { value: "Binary classification", label: "Classificação binária" },
+  { value: "Multiclass classification", label: "Classificação multiclasse" },
+  { value: "Text classification", label: "Classificação de texto" },
+  { value: "Image classification", label: "Classificação de imagens" },
+  { value: "Regression", label: "Regressão" },
+  { value: "Clustering", label: "Agrupamento (clustering)" },
+  { value: "Anomaly detection", label: "Deteção de anomalias" },
+  { value: "Ranking", label: "Ranking" },
+  { value: "Recommendation", label: "Recomendação" },
+  { value: "Forecasting", label: "Previsão (forecasting)" },
+  { value: "Object detection", label: "Deteção de objetos" },
+] as const;
+
+type MachineLearningTask = typeof MACHINE_LEARNING_TASKS[number]["value"];
+
+function normalizeTaskSelection(value: unknown): MachineLearningTask[] {
+  const values = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
+  return MACHINE_LEARNING_TASKS
+      .filter((task) => values.includes(task.value))
+      .map((task) => task.value);
+}
+
+function displayTaskSelection(value: unknown): string {
+  const selected = normalizeTaskSelection(value);
+  if (!selected.length) return "Não identificada";
+  return selected.map((item) =>
+      MACHINE_LEARNING_TASKS.find((task) => task.value === item)?.label || item,
+  ).join(", ");
+}
+
 const FIELD_LABELS: Record<MetadataFieldName, string> = {
   title: "Título",
   description: "Descrição",
@@ -168,6 +199,61 @@ const FIELD_LABELS: Record<MetadataFieldName, string> = {
   language: "Idioma",
   number_of_records: "Número de registos",
 };
+
+const LANGUAGE_CODE_NAMES: Record<string, string> = {
+  ar: "Arabic",
+  bg: "Bulgarian",
+  zh: "Chinese",
+  hr: "Croatian",
+  cs: "Czech",
+  da: "Danish",
+  nl: "Dutch",
+  en: "English",
+  et: "Estonian",
+  fi: "Finnish",
+  fr: "French",
+  de: "German",
+  el: "Greek",
+  he: "Hebrew",
+  hi: "Hindi",
+  hu: "Hungarian",
+  id: "Indonesian",
+  it: "Italian",
+  ja: "Japanese",
+  ko: "Korean",
+  no: "Norwegian",
+  pl: "Polish",
+  pt: "Portuguese",
+  ro: "Romanian",
+  ru: "Russian",
+  sr: "Serbian",
+  sk: "Slovak",
+  sl: "Slovenian",
+  es: "Spanish",
+  sv: "Swedish",
+  th: "Thai",
+  tr: "Turkish",
+  uk: "Ukrainian",
+  vi: "Vietnamese",
+};
+
+function languageNameToCode(value: string): string {
+  const normalized = value.trim();
+  const normalizedLowerCase = normalized.toLowerCase();
+  const matchingCode = Object.entries(LANGUAGE_CODE_NAMES).find(
+      ([, name]) => name.toLowerCase() === normalizedLowerCase,
+  )?.[0];
+
+  return matchingCode || normalizedLowerCase;
+}
+
+function languageToSelectValue(value: unknown): string {
+  const rawValue = Array.isArray(value) ? value[0] : value;
+
+  return typeof rawValue === "string"
+      ? languageNameToCode(rawValue)
+      : "";
+}
 
 function isEmpty(value: unknown): boolean {
   if (value === null || value === undefined) {
@@ -189,9 +275,13 @@ function isEmpty(value: unknown): boolean {
   return false;
 }
 
-function displayValue(value: unknown): string {
+function displayValue(value: unknown, fieldName?: MetadataFieldName): string {
   if (isEmpty(value)) {
     return "Não identificado";
+  }
+
+  if (fieldName === "machine_learning_task") {
+    return displayTaskSelection(value);
   }
 
   if (Array.isArray(value)) {
@@ -222,6 +312,10 @@ function fieldToInput(
 
   if (fieldName === "keywords" && Array.isArray(value)) {
     return value.map((item) => String(item)).join("\n");
+  }
+
+  if (fieldName === "machine_learning_task") {
+    return JSON.stringify(normalizeTaskSelection(value));
   }
 
   if (fieldName === "date_published" && typeof value === "string") {
@@ -260,6 +354,19 @@ function parseFieldInput(
         .split("\n")
         .map((item) => item.trim())
         .filter(Boolean);
+  }
+
+  if (fieldName === "machine_learning_task") {
+    if (!input.trim()) return [];
+    try {
+      return normalizeTaskSelection(JSON.parse(input));
+    } catch {
+      return normalizeTaskSelection(input);
+    }
+  }
+
+  if (fieldName === "language") {
+    return input.trim();
   }
 
   return input.trim();
@@ -303,10 +410,10 @@ function App() {
   const [editingValues, setEditingValues] =
       useState<Partial<Record<MetadataFieldName, string>>>({});
 
-  // Identidades estruturadas dos criadores. Os nomes são sempre obtidos
-  // através da ORCID (pessoas) ou do registo ROR (organizações).
+  // Identidades estruturadas dos criadores; nomes vêm dos registos públicos.
   const [creatorDraft, setCreatorDraft] = useState<CreatorIdentity[]>([]);
-  const [orcidSessionToken, setOrcidSessionToken] = useState("");
+  const [orcidInput, setOrcidInput] = useState("");
+  const [orcidBusy, setOrcidBusy] = useState(false);
   const [rorInput, setRorInput] = useState("");
   const [rorBusy, setRorBusy] = useState(false);
   const [creatorMessage, setCreatorMessage] = useState("");
@@ -349,38 +456,6 @@ function App() {
         });
   }, []);
 
-  // Recebe apenas mensagens do callback OAuth servido pelo backend local.
-  useEffect(() => {
-    function handleOrcidMessage(event: MessageEvent<OrcidPopupMessage>) {
-      if (event.origin !== API_URL || event.data?.source !== "zenodo-metadata-orcid") {
-        return;
-      }
-
-      const data = event.data;
-      if (data.status === "error") {
-        setCreatorError(data.message || "Não foi possível autenticar a ORCID.");
-        return;
-      }
-
-      if (!data.creator || !data.creator_session_token) {
-        setCreatorError("A resposta da ORCID não contém a identidade e a sessão necessárias.");
-        return;
-      }
-
-      setOrcidSessionToken(data.creator_session_token);
-      setCreatorDraft((previous) => {
-        const withoutPerson = previous.filter((item) => item.creator_type !== "person");
-        return [...withoutPerson, data.creator!];
-      });
-      setCreatorError("");
-      setCreatorMessage(`Identidade ORCID autenticada: ${data.creator.name}.`);
-      setEditingValues((previous) => ({ ...previous, creators: "" }));
-    }
-
-    window.addEventListener("message", handleOrcidMessage);
-    return () => window.removeEventListener("message", handleOrcidMessage);
-  }, []);
-
   // ==========================================================
   // ANALYZE REPOSITORY
   // ==========================================================
@@ -399,7 +474,7 @@ function App() {
     setSelectedDatasetPath("");
     setEditingValues({});
     setCreatorDraft([]);
-    setOrcidSessionToken("");
+    setOrcidInput("");
     setRorInput("");
     setCreatorMessage("");
     setCreatorError("");
@@ -468,7 +543,7 @@ function App() {
     setCroissant(null);
     setEditingValues({});
     setCreatorDraft([]);
-    setOrcidSessionToken("");
+    setOrcidInput("");
     setRorInput("");
     setCreatorMessage("");
     setCreatorError("");
@@ -509,17 +584,52 @@ function App() {
   // CRIADORES: ORCID E ROR
   // ==========================================================
 
-  function startOrcidAuthentication() {
+  async function addResearcherByOrcid() {
+    const identifier = orcidInput.trim();
+    if (!identifier) {
+      setCreatorError("Introduz um ORCID iD ou URL ORCID.");
+      return;
+    }
+
+    setOrcidBusy(true);
     setCreatorError("");
     setCreatorMessage("");
-    const popup = window.open(
-        `${API_URL}/api/v1/orcid/authorize`,
-        "zenodo-orcid-auth",
-        "popup=yes,width=620,height=760",
-    );
 
-    if (!popup) {
-      setCreatorError("O navegador bloqueou a janela ORCID. Permite pop-ups para esta aplicação e tenta novamente.");
+    try {
+      const response = await fetch(
+          `${API_URL}/api/v1/orcid/validate/${encodeURIComponent(identifier)}`,
+      );
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(getErrorMessage(data, "Não foi possível validar o ORCID iD."));
+      }
+
+      const researcher = data as OrcidValidation;
+      if (!researcher.valid || !researcher.exists || !researcher.name) {
+        throw new Error("O ORCID iD não corresponde a um investigador com nome público.");
+      }
+
+      setCreatorDraft((previous) => {
+        if (previous.some((item) => item.creator_type === "person")) {
+          return previous;
+        }
+        return [
+          ...previous,
+          {
+            creator_type: "person",
+            name: researcher.name,
+            orcid_id: researcher.orcid_id,
+          },
+        ];
+      });
+      setOrcidInput("");
+      setCreatorMessage(`Investigador obtido do registo ORCID: ${researcher.name}.`);
+      setEditingValues((previous) => ({ ...previous, creators: "" }));
+    } catch (err) {
+      setCreatorError(err instanceof Error ? err.message : "Erro ao validar o investigador.");
+    } finally {
+      setOrcidBusy(false);
     }
   }
 
@@ -575,9 +685,7 @@ function App() {
     const removed = creatorDraft[index];
     setCreatorDraft((previous) => previous.filter((_, itemIndex) => itemIndex !== index));
 
-    if (removed?.creator_type === "person") {
-      setOrcidSessionToken("");
-    }
+    if (removed?.creator_type === "person") setOrcidInput("");
   }
 
   // ==========================================================
@@ -598,10 +706,14 @@ function App() {
     if (action === "edit") {
       const input =
           editingValues[fieldName] ??
-          fieldToInput(
-              fieldName,
-              !isEmpty(field.value) ? field.value : field.suggested_value,
-          );
+          (fieldName === "language"
+              ? languageToSelectValue(
+                  !isEmpty(field.value) ? field.value : field.suggested_value,
+              )
+              : fieldToInput(
+                  fieldName,
+                  !isEmpty(field.value) ? field.value : field.suggested_value,
+              ));
 
       try {
         editedValue = fieldName === "creators"
@@ -616,7 +728,7 @@ function App() {
         return;
       }
 
-      if (isEmpty(editedValue)) {
+      if (isEmpty(editedValue) && fieldName !== "machine_learning_task") {
         setError(
             `O campo "${FIELD_LABELS[fieldName]}" não pode ficar vazio.`,
         );
@@ -633,6 +745,25 @@ function App() {
         action,
         ...(action === "edit" ? { value: editedValue } : {}),
       };
+      const suggestedLanguage = extraction.metadata.language.suggested_value;
+      const metadataForReview =
+          fieldName === "language" && action === "accept"
+              ? {
+                ...extraction.metadata,
+                language: {
+                  ...extraction.metadata.language,
+                  suggested_value: Array.isArray(suggestedLanguage)
+                      ? suggestedLanguage.map((language) =>
+                        typeof language === "string"
+                            ? languageNameToCode(language)
+                            : language,
+                      )
+                      : typeof suggestedLanguage === "string"
+                          ? languageNameToCode(suggestedLanguage)
+                          : suggestedLanguage,
+                },
+              }
+              : extraction.metadata;
 
       const response = await fetch(`${API_URL}/api/v1/metadata/confirm`, {
         method: "POST",
@@ -640,13 +771,10 @@ function App() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          metadata: extraction.metadata,
+          metadata: metadataForReview,
           reviews: {
             [fieldName]: review,
           },
-          ...(orcidSessionToken
-              ? { orcid_session_token: orcidSessionToken }
-              : {}),
         }),
       });
 
@@ -698,10 +826,12 @@ function App() {
 
       setEditingValues((previous) => ({
         ...previous,
-        [fieldName]: fieldToInput(
-            fieldName,
-            result.metadata[fieldName].value,
-        ),
+        [fieldName]: fieldName === "language"
+            ? languageToSelectValue(result.metadata[fieldName].value)
+            : fieldToInput(
+                fieldName,
+                result.metadata[fieldName].value,
+            ),
       }));
 
       setCroissant(null);
@@ -778,7 +908,6 @@ function App() {
           ...(ref.trim() ? { ref: ref.trim() } : {}),
           dataset_path: selectedDatasetPath,
           metadata: extraction.metadata,
-          ...(orcidSessionToken ? { orcid_session_token: orcidSessionToken } : {}),
         }),
       });
 
@@ -849,16 +978,28 @@ function App() {
     const fieldBusy = busyField === fieldName;
     const hasSuggestion = !isEmpty(field.suggested_value);
     const hasCurrentValue = !isEmpty(field.value);
-    const shownValue = hasCurrentValue
+    const shownValue = field.status === "confirmed"
         ? field.value
-        : field.suggested_value;
+        : hasCurrentValue
+            ? field.value
+            : field.suggested_value;
+
+    const languageValue = languageToSelectValue(
+        field.status === "confirmed"
+            ? field.value
+            : hasCurrentValue ? field.value : field.suggested_value,
+    );
 
     const inputValue =
         editingValues[fieldName] ??
-        fieldToInput(
-            fieldName,
-            hasCurrentValue ? field.value : field.suggested_value,
-        );
+        (fieldName === "language"
+            ? languageValue
+            : fieldToInput(
+                fieldName,
+                field.status === "confirmed"
+                    ? field.value
+                    : hasCurrentValue ? field.value : field.suggested_value,
+            ));
 
     const statusLabel =
         field.status === "confirmed"
@@ -907,7 +1048,7 @@ function App() {
           </span>
 
             <p className="field-value">
-              {displayValue(shownValue)}
+              {displayValue(shownValue, fieldName)}
             </p>
           </div>
 
@@ -935,22 +1076,29 @@ function App() {
           <div className="editor-block">
             {fieldName === "creators" ? (
                 <div className="creators-editor">
-                  <div className="creator-type-actions">
-                    <button
-                        type="button"
-                        className="button-primary"
-                        onClick={startOrcidAuthentication}
-                        disabled={loading || creatorDraft.some((item) => item.creator_type === "person")}
-                    >
-                      {creatorDraft.some((item) => item.creator_type === "person")
-                          ? "Investigador autenticado"
-                          : "Adicionar investigador com ORCID"}
-                    </button>
-                  </div>
-                  <p className="editor-help">
-                    A pessoa é identificada através da autenticação ORCID. O nome e o ORCID
-                    são recebidos diretamente da ORCID; não introduzas nomes manualmente.
-                  </p>
+                    <label htmlFor="creator-orcid">Adicionar investigador através de ORCID iD</label>
+                    <div className="ror-entry">
+                      <input
+                          id="creator-orcid"
+                          type="text"
+                          value={orcidInput}
+                          onChange={(event) => setOrcidInput(event.target.value)}
+                          placeholder="Ex.: 0000-0002-1825-0097 ou URL ORCID"
+                          disabled={loading || orcidBusy || creatorDraft.some((item) => item.creator_type === "person")}
+                      />
+                      <button
+                          type="button"
+                          className="button-primary"
+                          onClick={() => void addResearcherByOrcid()}
+                          disabled={loading || orcidBusy || !orcidInput.trim() || creatorDraft.some((item) => item.creator_type === "person")}
+                      >
+                        {orcidBusy ? "A validar..." : "Validar e adicionar"}
+                      </button>
+                    </div>
+                    <p className="editor-help">
+                      O nome é obtido automaticamente do registo público ORCID. Esta consulta
+                      não confirma que és titular desse ORCID iD.
+                    </p>
 
                   <label htmlFor="creator-ror">Adicionar organização através de ROR ID</label>
                   <div className="ror-entry">
@@ -1007,6 +1155,46 @@ function App() {
                       <p className="creator-empty">Ainda não adicionaste investigadores ou organizações.</p>
                   )}
                 </div>
+            ) : fieldName === "machine_learning_task" ? (
+                <div className="task-editor">
+                  <span className="task-editor-title">Seleciona uma ou mais tarefas</span>
+                  <p className="editor-help">
+                    A IA sugere no máximo uma tarefa principal. Podes selecionar
+                    outras tarefas se também forem adequadas ao dataset. Se não
+                    selecionares nenhuma, confirma a lista vazia ou rejeita a sugestão.
+                  </p>
+                  <div className="task-checkbox-list">
+                    {MACHINE_LEARNING_TASKS.map((task) => {
+                      let selectedTasks: MachineLearningTask[] = [];
+                      try {
+                        selectedTasks = normalizeTaskSelection(
+                            inputValue ? JSON.parse(inputValue) : [],
+                        );
+                      } catch {
+                        selectedTasks = [];
+                      }
+                      return (
+                          <label className="task-checkbox" key={task.value}>
+                            <input
+                                type="checkbox"
+                                checked={selectedTasks.includes(task.value)}
+                                disabled={fieldBusy || loading}
+                                onChange={(event) => {
+                                  const nextTasks = event.target.checked
+                                      ? [...selectedTasks, task.value]
+                                      : selectedTasks.filter((item) => item !== task.value);
+                                  setEditingValues((previous) => ({
+                                    ...previous,
+                                    machine_learning_task: JSON.stringify(nextTasks),
+                                  }));
+                                }}
+                            />
+                            <span>{task.label}</span>
+                          </label>
+                      );
+                    })}
+                  </div>
+                </div>
             ) : (
                 <>
                   <label htmlFor={`editor-${fieldName}`}>
@@ -1015,7 +1203,34 @@ function App() {
                         : "Editar valor"}
                   </label>
 
-                  {fieldName === "date_published" ? (
+                  {fieldName === "language" ? (
+                      <select
+                          id={`editor-${fieldName}`}
+                          className="field-editor"
+                          value={inputValue}
+                          onChange={(event) =>
+                              setEditingValues((previous) => ({
+                                ...previous,
+                                language: event.target.value,
+                              }))
+                          }
+                          disabled={fieldBusy || loading}
+                      >
+                        <option value="">Seleciona um idioma...</option>
+                        {languageValue &&
+                            !Object.prototype.hasOwnProperty.call(
+                                LANGUAGE_CODE_NAMES,
+                                languageValue,
+                            ) && (
+                                <option value={languageValue}>{languageValue}</option>
+                            )}
+                        {Object.entries(LANGUAGE_CODE_NAMES).map(([code, language]) => (
+                            <option key={code} value={code}>
+                              {language}
+                            </option>
+                        ))}
+                      </select>
+                  ) : fieldName === "date_published" ? (
                       <input
                           id={`editor-${fieldName}`}
                           className="field-editor date-editor"
@@ -1166,21 +1381,17 @@ function App() {
                 dataset que pretendes utilizar.
               </p>
 
-              <button
-                  type="submit"
-                  disabled={loading || !url.trim()}
-              >
+              <button type="submit" disabled={loading || !url.trim()}>
                 {loading ? "A analisar..." : "Analisar repositório"}
               </button>
             </div>
           </form>
         </section>
 
-        {/* MESSAGES */}
+        {/* FEEDBACK */}
 
         {error && (
             <section className="message error">
-              <strong>Ocorreu um erro</strong>
               <p>{error}</p>
             </section>
         )}
@@ -1196,75 +1407,54 @@ function App() {
         {analysis && (
             <>
               <section className="panel">
-                <p className="eyebrow">REPOSITÓRIO ANALISADO</p>
+                <p className="eyebrow">REPOSITORY ANALYSIS</p>
 
-                <h2>{analysis.repository.full_name}</h2>
-
-                <p>
-                  {analysis.repository.description || "Sem descrição no GitHub."}
-                </p>
-
-                <a
-                    href={analysis.repository.url}
-                    target="_blank"
-                    rel="noreferrer"
-                >
-                  Abrir no GitHub ↗
-                </a>
+                <h2>Repositório analisado</h2>
 
                 <div className="details">
+                  <span>Repositório</span>
+                  <strong>{analysis.repository.full_name}</strong>
+
+                  <span>URL</span>
+                  <strong>
+                    <a href={analysis.repository.url} target="_blank" rel="noreferrer">
+                      {analysis.repository.url}
+                    </a>
+                  </strong>
+
                   <span>Branch / referência</span>
                   <strong>{analysis.repository.selected_ref}</strong>
 
                   <span>Commit</span>
-                  <strong className="hash">
-                    {analysis.repository.commit_sha}
-                  </strong>
+                  <strong className="hash">{analysis.repository.commit_sha}</strong>
 
-                  <span>Licença GitHub</span>
-                  <strong>
-                    {analysis.repository.license || "Não identificada"}
-                  </strong>
+                  <span>Licença do repositório</span>
+                  <strong>{analysis.repository.license || "Não identificada"}</strong>
                 </div>
-              </section>
 
-              {/* INVENTORY */}
+                <div className="stats">
+                  <div className="stat">
+                    <strong>{analysis.inventory.total_files}</strong>
+                    <span>Ficheiros analisados</span>
+                  </div>
 
-              <section className="stats">
-                <article className="stat">
-                  <strong>{analysis.inventory.total_files}</strong>
-                  <span>Ficheiros</span>
-                </article>
+                  <div className="stat">
+                    <strong>{analysis.inventory.metadata_files_read}</strong>
+                    <span>Ficheiros de metadados lidos</span>
+                  </div>
 
-                <article className="stat">
-                  <strong>{analysis.inventory.metadata_files_read}</strong>
-                  <span>Metadados lidos</span>
-                </article>
+                  <div className="stat">
+                    <strong>{analysis.inventory.dataset_candidates_found}</strong>
+                    <span>Datasets candidatos</span>
+                  </div>
+                </div>
 
-                <article className="stat">
-                  <strong>{analysis.inventory.dataset_candidates_found}</strong>
-                  <span>Candidatos a datasets</span>
-                </article>
-              </section>
-
-              {/* DATASET SELECTION */}
-
-              <section className="panel">
-                <p className="eyebrow">DATASET SELECTION</p>
-
-                <h2>Selecionar dataset</h2>
-
-                <p className="hint">
-                  Escolhe o ficheiro que pretendes inspecionar e utilizar para
-                  gerar os metadados Croissant.
-                </p>
-
-                {analysis.dataset_candidates.length === 0 ? (
-                    <p>Não foram encontrados candidatos a datasets.</p>
-                ) : (
+                {analysis.dataset_candidates.length > 0 ? (
                     <>
+                      <h3>Selecionar dataset</h3>
+
                       <label htmlFor="dataset-select">
-                        Dataset disponível
+                        Dataset a inspecionar
                       </label>
 
                       <select
@@ -1315,6 +1505,10 @@ function App() {
                           </p>
                       )}
                     </>
+                ) : (
+                    <p className="hint">
+                      Não foram encontrados ficheiros suportados para inspeção.
+                    </p>
                 )}
               </section>
 
