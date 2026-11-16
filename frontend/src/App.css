@@ -750,6 +750,204 @@ a {
   }
 }
 
+/*
+ * Camada visual da experiência: superfícies, estados e etapas do fluxo.
+ * Mantém as classes existentes para que as regras de domínio da interface
+ * (revisão, confirmação e estados vazios) continuem independentes do tema.
+ */
+:root {
+  color-scheme: light;
+  --ink: #172923;
+  --muted: #66776f;
+  --line: #dce6df;
+  --green: #176448;
+  --green-dark: #104b36;
+  --green-soft: #e8f4ed;
+  --surface: #fff;
+  --surface-raised: #f8fbf9;
+}
+
+body {
+  color: var(--ink);
+  background:
+    radial-gradient(ellipse at 8% 0%, rgba(66, 139, 101, .12), transparent 34rem),
+    radial-gradient(ellipse at 96% 14%, rgba(213, 181, 115, .10), transparent 28rem),
+    #f3f6f4;
+}
+
+.page {
+  width: min(1120px, calc(100% - 48px));
+  padding: 56px 0 96px;
+}
+
+.hero {
+  max-width: 750px;
+  padding: 8px 0 30px;
+}
+
+.hero .eyebrow,
+.section-heading .eyebrow {
+  color: var(--green);
+  letter-spacing: .14em;
+}
+
+.hero h1 {
+  color: #102b20;
+  font-size: clamp(2.5rem, 6vw, 4.4rem);
+  letter-spacing: -.06em;
+  line-height: 1.01;
+}
+
+.subtitle {
+  max-width: 640px;
+  margin-top: 20px;
+  color: var(--muted);
+  font-size: 1.08rem;
+}
+
+.workflow {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 4px 0 24px;
+  padding: 16px 20px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, .72);
+}
+
+.workflow-step {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 11px;
+  color: #819087;
+}
+
+.workflow-step > span:last-child { display: grid; gap: 2px; }
+.workflow-step strong { color: #6c7c73; font-size: .85rem; }
+.workflow-step small { color: #86938c; font-size: .74rem; }
+.workflow-step.is-current strong,
+.workflow-step.is-complete strong { color: #183e2e; }
+
+.workflow-number {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid #d7e1da;
+  border-radius: 50%;
+  color: #7b8981;
+  background: #f6f8f6;
+  font-size: .72rem;
+  font-weight: 800;
+}
+
+.workflow-step.is-current .workflow-number,
+.workflow-step.is-complete .workflow-number {
+  border-color: var(--green);
+  color: white;
+  background: var(--green);
+}
+
+.workflow-connector {
+  height: 1px;
+  flex: 1 1 24px;
+  background: #dce5de;
+}
+.workflow-connector.is-complete { background: #5d9a78; }
+
+.status-panel { gap: 12px; margin-bottom: 20px; }
+.status-panel > div {
+  position: relative;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 12px 15px;
+  border-color: var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, .7);
+}
+.status-panel strong { margin-left: auto; color: #345546; font-size: .83rem; }
+.service-indicator { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #a5b0aa; }
+.service-online .service-indicator { background: #299268; box-shadow: 0 0 0 3px #e4f3e9; }
+.service-offline .service-indicator { background: #c17b50; box-shadow: 0 0 0 3px #faeee5; }
+
+.panel {
+  margin: 16px 0;
+  padding: clamp(22px, 4vw, 34px);
+  border-color: rgba(210, 223, 214, .9);
+  border-radius: 18px;
+  box-shadow: 0 12px 34px rgba(27, 52, 39, .045), 0 1px 2px rgba(27, 52, 39, .035);
+}
+
+.repository-panel { border-top: 3px solid #2e7957; }
+.section-heading { display: flex; align-items: center; gap: 13px; margin-bottom: 22px; }
+.section-heading .eyebrow { margin-bottom: 4px; font-size: .64rem; }
+.section-heading h2 { margin: 0; }
+.section-icon {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid #d5e8dc;
+  border-radius: 13px;
+  color: var(--green);
+  background: var(--green-soft);
+  font-size: 1.25rem;
+}
+
+input, select, textarea {
+  border-color: #d2ded6;
+  border-radius: 11px;
+  background: #fcfdfc;
+}
+input::placeholder { color: #9ba79f; }
+input:focus, select:focus, textarea:focus {
+  border-color: #438c68;
+  box-shadow: 0 0 0 3px rgba(67, 140, 104, .13);
+}
+label { color: #30473a; }
+
+button[type="submit"], .button-primary {
+  border-radius: 11px;
+  color: #fff;
+  background: var(--green);
+  box-shadow: 0 2px 5px rgba(19, 82, 56, .14);
+}
+button[type="submit"]:hover:not(:disabled), .button-primary:hover:not(:disabled) { background: var(--green-dark); }
+.button-secondary { border-color: #c9ddd0; color: #205d43; background: #edf6f0; }
+.button-quiet { color: #8a4a44; }
+.form-footer { align-items: center; }
+.form-footer .hint { margin: 0; }
+
+.message { border-radius: 12px; box-shadow: 0 2px 8px rgba(27, 52, 39, .025); }
+.details { border: 1px solid #e6ede8; background: #f7faf8; }
+.stat, .metadata-card { border-color: #e0e9e3; }
+.stat { border-radius: 13px; background: var(--surface-raised); }
+.metadata-card { border-radius: 14px; background: #fff; }
+.metadata-card.confirmed { border-color: #b9dac5; }
+.metadata-card.rejected { border-color: #e4c5c0; }
+
+@media (max-width: 680px) {
+  .page { width: min(100% - 28px, 620px); padding: 32px 0 64px; }
+  .workflow { align-items: flex-start; gap: 8px; padding: 13px 12px; }
+  .workflow-step { flex-direction: column; align-items: flex-start; gap: 6px; }
+  .workflow-step small { display: none; }
+  .workflow-step strong { font-size: .72rem; }
+  .workflow-connector { margin-top: 17px; }
+  .status-panel > div { flex-basis: 100%; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .panel { animation: panel-enter 360ms ease both; }
+  @keyframes panel-enter {
+    from { opacity: 0; transform: translateY(7px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+}
+
 /* =========================================================
    MACHINE LEARNING TASK CHECKBOXES
    ========================================================= */
