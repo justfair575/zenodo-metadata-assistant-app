@@ -2,6 +2,7 @@ import base64
 import binascii
 import csv
 import io
+import json
 import os
 import re
 
@@ -15,13 +16,16 @@ from pydantic import BaseModel, Field, field_validator
 
 GITHUB_API = "https://api.github.com"
 
-MAX_METADATA_FILES = 20
+MAX_METADATA_FILES = 80
 MAX_METADATA_FILE_BYTES = 200_000
-MAX_TOTAL_METADATA_BYTES = 1_000_000
+MAX_TOTAL_METADATA_BYTES = 4_000_000
 DOCUMENTATION_EXTENSIONS = {
     ".adoc",
+    ".bib",
     ".cff",
+    ".cfg",
     ".html",
+    ".ini",
     ".json",
     ".md",
     ".mdx",
@@ -49,6 +53,8 @@ DOCUMENTATION_NAME_HINTS = (
     "author",
     "citation",
     "codemeta",
+    "contributors",
+    "creator",
     "croissant",
     "config",
     "datacite",
@@ -61,12 +67,15 @@ DOCUMENTATION_NAME_HINTS = (
     "dataset-info",
     "dataset-metadata",
     "dataset-schema",
+    "dataset-description",
     "description",
     "info",
     "metadata",
     "readme",
     "schema",
     "ro-crate",
+    "schemaorg",
+    "subjects",
 )
 
 MAX_DATASET_CANDIDATES = 100
@@ -86,6 +95,8 @@ METADATA_NAMES = {
     "readme.rst",
     "readme.txt",
     "citation.cff",
+    "citation.bib",
+    "citation.json",
     "codemeta.json",
     "license",
     "license.md",
@@ -98,6 +109,9 @@ METADATA_NAMES = {
     "contributors.md",
     "zenodo.json",
     "datacite.json",
+    "datapackage.json",
+    "ro-crate-metadata.json",
+    "ro-crate-metadata.jsonld",
     "pyproject.toml",
     "package.json",
     "dataset-metadata.json",
@@ -107,11 +121,13 @@ METADATA_NAMES = {
     "data-dictionary.rst",
     "dataset_info.json",
     "dataset_infos.json",
+    "dataset_description.json",
+    "dataset_card.json",
     "metadata.json",
+    "citation.json",
     "datacard.md",
     "dataset_card.md",
 }
-
 
 def metadata_candidate_score(
         item: dict,
@@ -150,23 +166,33 @@ def metadata_candidate_score(
         len(parts) == 1
         and extension in {".adoc", ".md", ".mdx", ".org", ".rst", ".text", ".txt"}
     )
+    root_structured_document = (
+        len(parts) == 1
+        and extension in {
+            ".bib", ".cff", ".cfg", ".ini", ".toml", ".xml", ".yaml", ".yml",
+        }
+    )
     if not (
         is_readme
         or is_known_name
         or has_name_hint
+        or root_structured_document
         or (
             is_text_document
             and (in_documentation_directory or root_text_document)
         )
     ):
         return None
-    if not is_text_document and not (is_known_name or has_name_hint):
+    if not is_text_document and not (
+        is_known_name or has_name_hint or root_structured_document
+    ):
         return None
     if (
         extension in {".json", ".jsonld", ".toml", ".xml", ".yaml", ".yml"}
         and not (
             is_known_name
             or has_name_hint
+            or root_structured_document
             or in_structured_metadata_directory
         )
     ):
@@ -185,7 +211,7 @@ def metadata_candidate_score(
         score += 15
     elif directories.intersection({"docs", "documentation", "metadata", "dataset", "datasets"}):
         score += 8
-    if extension in {".json", ".yaml", ".yml", ".toml", ".cff"}:
+    if extension in {".json", ".jsonld", ".yaml", ".yml", ".toml", ".cff", ".xml", ".bib"}:
         score += 5
 
     if dataset_path:
@@ -204,6 +230,7 @@ DATA_EXTENSIONS = {
     ".tsv",
     ".json",
     ".jsonl",
+    ".ndjson",
     ".parquet",
     ".arrow",
     ".feather",
@@ -239,6 +266,79 @@ MISSING_VALUES = {
     "null",
     "none",
 }
+
+INSPECTABLE_DATA_EXTENSIONS = {
+    ".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".txt",
+}
+
+
+def _json_records(text_content: str, extension: str) -> list[dict]:
+    """Read JSON records from common dataset export shapes."""
+    try:
+        if extension in {".jsonl", ".ndjson"}:
+            values = [
+                json.loads(line)
+                for line in text_content.splitlines()
+                if line.strip()
+            ]
+        else:
+            document = json.loads(text_content)
+            if isinstance(document, list):
+                values = document
+            elif isinstance(document, dict):
+                values = next(
+                    (
+                        document[key]
+                        for key in ("data", "records", "items", "rows", "examples")
+                        if isinstance(document.get(key), list)
+                    ),
+                    [document],
+                )
+            else:
+                values = [{"value": document}]
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(
+            422,
+            "O ficheiro não contém JSON/JSONL válido.",
+        ) from exc
+
+    return [
+        item if isinstance(item, dict) else {"value": item}
+        for item in values
+    ]
+
+
+def _inspect_json_records(text_content: str, extension: str) -> dict:
+    records = _json_records(text_content, extension)
+    columns = list(dict.fromkeys(key for row in records for key in row))
+    samples = records[:MAX_SAMPLE_ROWS]
+
+    def cell(value):
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
+
+    column_info = []
+    for column in columns:
+        values = [cell(row.get(column, "")) for row in records]
+        present = [value for value in values if not is_missing(value)]
+        column_info.append({
+            "name": str(column),
+            "inferred_type": infer_column_type(present[:MAX_TYPE_INFERENCE_ROWS]),
+            "missing_values": len(values) - len(present),
+        })
+
+    return {
+        "number_of_records": len(records),
+        "number_of_columns": len(columns),
+        "columns": column_info,
+        "sample_rows": [
+            {str(key): cell(value) for key, value in row.items()}
+            for row in samples
+        ],
+    }
 
 
 class AnalyzeRequest(BaseModel):
@@ -336,6 +436,24 @@ def github_headers() -> dict:
     return headers
 
 
+def decode_metadata_text(raw: bytes) -> tuple[str, str]:
+    """Decode common documentation encodings without dropping readable files."""
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16"), "utf-16"
+    if b"\x00" in raw:
+        raise UnicodeDecodeError(
+            "metadata",
+            raw,
+            0,
+            min(len(raw), 1),
+            "binary content is not documentation text",
+        )
+    try:
+        return raw.decode("utf-8-sig"), "utf-8"
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace"), "cp1252"
+
+
 async def github_get(
         client: httpx.AsyncClient,
         path: str,
@@ -387,6 +505,39 @@ async def github_get(
             502,
             "Resposta inválida da API GitHub.",
         ) from exc
+
+
+async def github_raw_get(
+        client: httpx.AsyncClient,
+        url: str,
+        max_bytes: int,
+) -> bytes:
+    """Download a commit-pinned public file without spending API rate limit."""
+    content = bytearray()
+    try:
+        async with client.stream("GET", url) as response:
+            if response.status_code == 404:
+                raise HTTPException(404, "Ficheiro não encontrado no commit selecionado.")
+            if not response.is_success:
+                raise HTTPException(
+                    502,
+                    f"Erro ao descarregar um ficheiro do GitHub: HTTP {response.status_code}.",
+                )
+            async for chunk in response.aiter_bytes():
+                if len(content) + len(chunk) > max_bytes:
+                    raise HTTPException(413, "O ficheiro excede o limite de leitura.")
+                content.extend(chunk)
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            504,
+            "O GitHub demorou demasiado tempo a devolver um ficheiro.",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            502,
+            "Não foi possível descarregar um ficheiro do GitHub.",
+        ) from exc
+    return bytes(content)
 
 
 def get_repository_parts(url: str) -> tuple[str, str]:
@@ -473,7 +624,7 @@ async def analyze_github_repository(
             )
 
         dataset_path = getattr(request, "dataset_path", None)
-        metadata_candidates = sorted(
+        ranked_metadata_candidates = sorted(
             (
                 (metadata_candidate_score(item, dataset_path), item)
                 for item in files
@@ -483,18 +634,44 @@ async def analyze_github_repository(
                 candidate[1]["path"].lower(),
             ),
         )
+        metadata_candidate_count = sum(
+            score is not None
+            for score, _ in ranked_metadata_candidates
+        )
         metadata_candidates = [
             item
-            for score, item in metadata_candidates
+            for score, item in ranked_metadata_candidates
             if score is not None
         ][:MAX_METADATA_FILES]
+        if metadata_candidate_count > MAX_METADATA_FILES:
+            warnings.append(
+                f"Foram encontrados {metadata_candidate_count} ficheiros potencialmente "
+                f"úteis; foram selecionados os {MAX_METADATA_FILES} mais relevantes "
+                "para respeitar o limite de leitura."
+            )
 
         all_dataset_candidates = [
             item
             for item in files
             if os.path.splitext(item["path"])[1].lower()
                in DATA_EXTENSIONS
+            and os.path.basename(item["path"]).lower() not in METADATA_NAMES
         ]
+
+        supported_dataset_candidates = [
+            item for item in all_dataset_candidates
+            if os.path.splitext(item["path"])[1].lower()
+            in INSPECTABLE_DATA_EXTENSIONS
+        ]
+        unsupported_candidate_count = (
+            len(all_dataset_candidates) - len(supported_dataset_candidates)
+        )
+        if unsupported_candidate_count:
+            warnings.append(
+                f"{unsupported_candidate_count} ficheiro(s) de dados foram encontrados, "
+                "mas não aparecem para seleção porque o conteúdo não é inspecionado "
+                "nesta versão (por exemplo, Parquet, Excel ou formatos multimédia)."
+            )
 
         dataset_candidates = [
             {
@@ -511,11 +688,11 @@ async def analyze_github_repository(
                     else "medium"
                 ),
             }
-            for item in all_dataset_candidates
+            for item in supported_dataset_candidates
             if item.get("size", 0) <= MAX_DATASET_FILE_BYTES
         ][:MAX_DATASET_CANDIDATES]
 
-        if len(all_dataset_candidates) > MAX_DATASET_CANDIDATES:
+        if len(supported_dataset_candidates) > MAX_DATASET_CANDIDATES:
             warnings.append(
                 "O número de candidatos ultrapassa o limite "
                 "de apresentação."
@@ -538,48 +715,56 @@ async def analyze_github_repository(
                 continue
 
             if total_bytes + size > MAX_TOTAL_METADATA_BYTES:
-                warnings.append(
-                    "Limite total de leitura de metadados atingido."
-                )
-                break
-
-            content = await github_get(
-                client,
-                f"/repos/{owner_path}/{repo_path}/contents/"
-                f"{quote(path, safe='/')}",
-                params={"ref": commit_sha},
-            )
-
-            if content.get("encoding") != "base64":
+                if "Limite total de leitura de metadados atingido." not in warnings:
+                    warnings.append(
+                        "Limite total de leitura de metadados atingido."
+                    )
                 metadata_files.append({
                     "path": path,
                     "size": size,
-                    "status": "unsupported_encoding",
+                    "status": "skipped_total_limit",
                 })
                 continue
 
+            raw_url = (
+                "https://raw.githubusercontent.com/"
+                f"{owner_path}/{repo_path}/"
+                f"{quote(commit_sha, safe='')}/"
+                f"{quote(path, safe='/')}"
+            )
             try:
-                encoded = "".join(
-                    content.get("content", "").split()
+                raw = await github_raw_get(
+                    client,
+                    raw_url,
+                    MAX_METADATA_FILE_BYTES,
                 )
+            except HTTPException as exc:
+                if exc.status_code == 413:
+                    metadata_files.append({
+                        "path": path,
+                        "size": size,
+                        "status": "skipped_too_large",
+                    })
+                    continue
+                raise
 
-                raw = base64.b64decode(
-                    encoded,
-                    validate=True,
-                )
-
-                text_content = raw.decode("utf-8-sig")
-
-            except (
-                    KeyError,
-                    ValueError,
-                    binascii.Error,
-                    UnicodeDecodeError,
-            ):
+            try:
+                text_content, encoding = decode_metadata_text(raw)
+            except UnicodeDecodeError:
                 metadata_files.append({
                     "path": path,
                     "size": size,
                     "status": "decode_error",
+                })
+                continue
+
+            if total_bytes + len(raw) > MAX_TOTAL_METADATA_BYTES:
+                if "Limite total de leitura de metadados atingido." not in warnings:
+                    warnings.append("Limite total de leitura de metadados atingido.")
+                metadata_files.append({
+                    "path": path,
+                    "size": len(raw),
+                    "status": "skipped_total_limit",
                 })
                 continue
 
@@ -589,9 +774,30 @@ async def analyze_github_repository(
                 "path": path,
                 "size": len(raw),
                 "sha": item.get("sha"),
+                "encoding": encoding,
                 "status": "read",
                 "content": text_content,
             })
+
+        oversized_metadata_count = sum(
+            item["status"] == "skipped_too_large"
+            for item in metadata_files
+        )
+        if oversized_metadata_count:
+            warnings.append(
+                f"{oversized_metadata_count} ficheiro(s) de metadados excedem "
+                f"o limite de {MAX_METADATA_FILE_BYTES // 1000} KB por ficheiro."
+            )
+
+        unreadable_metadata_count = sum(
+            item["status"] in {"unsupported_encoding", "decode_error"}
+            for item in metadata_files
+        )
+        if unreadable_metadata_count:
+            warnings.append(
+                f"{unreadable_metadata_count} ficheiro(s) não puderam ser "
+                "descodificados como texto."
+            )
 
         readme = next(
             (
@@ -630,7 +836,7 @@ async def analyze_github_repository(
             },
             "inventory": {
                 "total_files": len(files),
-                "metadata_files_found": len(metadata_candidates),
+                "metadata_files_found": metadata_candidate_count,
                 "metadata_files_read": sum(
                     item["status"] == "read"
                     for item in metadata_files
@@ -715,16 +921,16 @@ async def inspect_dataset_in_repository(
 
     extension = dataset["extension"]
 
-    if extension not in {".csv", ".tsv"}:
+    if extension not in INSPECTABLE_DATA_EXTENSIONS:
         raise HTTPException(
             422,
-            "Nesta versão só são suportados ficheiros CSV e TSV.",
+            "Formato ainda sem inspeção. São suportados CSV, TSV, JSON, JSONL e TXT.",
         )
 
     if dataset["size"] > MAX_INSPECTION_FILE_BYTES:
         raise HTTPException(
             413,
-            "O ficheiro ultrapassa o limite de 1 MB "
+            "O ficheiro ultrapassa o limite de 25 MB "
             "para inspeção nesta versão.",
         )
 
@@ -829,6 +1035,41 @@ async def inspect_dataset_in_repository(
                 422,
                 "Não foi possível descodificar o ficheiro.",
             ) from exc
+
+    if extension in {".json", ".jsonl", ".ndjson"}:
+        dataset_details = _inspect_json_records(text_content, extension)
+        return {
+            "repository": repository_data["repository"],
+            "dataset": {
+                "path": request.dataset_path,
+                "size": len(raw),
+                "format": extension,
+                "encoding": encoding,
+                "delimiter": "",
+                **dataset_details,
+            },
+        }
+
+    if extension == ".txt":
+        records = [line.strip() for line in text_content.splitlines() if line.strip()]
+        return {
+            "repository": repository_data["repository"],
+            "dataset": {
+                "path": request.dataset_path,
+                "size": len(raw),
+                "format": extension,
+                "encoding": encoding,
+                "delimiter": "",
+                "number_of_records": len(records),
+                "number_of_columns": 1,
+                "columns": [{
+                    "name": "text",
+                    "inferred_type": "string",
+                    "missing_values": 0,
+                }],
+                "sample_rows": [{"text": row} for row in records[:MAX_SAMPLE_ROWS]],
+            },
+        }
 
     delimiter = "\t" if extension == ".tsv" else ","
 

@@ -380,19 +380,24 @@ function getLocalDate(): string {
   return `${year}-${month}-${day}`;
 }
 
-function getErrorMessage(data: any, fallback: string): string {
-  if (typeof data?.detail === "string") {
-    return data.detail;
+function getErrorMessage(data: unknown, fallback: string): string {
+  if (typeof data !== "object" || data === null || !("detail" in data)) {
+    return fallback;
   }
 
-  if (data?.detail?.message) {
-    const pending = data.detail.pending_fields;
+  const detail = data.detail;
+  if (typeof detail === "string") {
+    return detail;
+  }
+
+  if (typeof detail === "object" && detail !== null && "message" in detail && typeof detail.message === "string") {
+    const pending = "pending_fields" in detail ? detail.pending_fields : undefined;
 
     if (Array.isArray(pending) && pending.length > 0) {
-      return `${data.detail.message} Campos pendentes: ${pending.join(", ")}.`;
+      return `${detail.message} Campos pendentes: ${pending.join(", ")}.`;
     }
 
-    return data.detail.message;
+    return detail.message;
   }
 
   return fallback;
@@ -874,8 +879,15 @@ function App() {
 
   const pendingFields = getPendingFields();
 
+  const croissantFormatSupported =
+      extraction !== null &&
+      [".csv", ".tsv"].includes(
+          extraction.selected_dataset.format.toLowerCase(),
+      );
+
   const canGenerateCroissant =
       extraction !== null &&
+      croissantFormatSupported &&
       pendingFields.length === 0 &&
       !loading &&
       busyField === null;
@@ -1307,7 +1319,7 @@ function App() {
         {/* HEADER */}
 
         <header className="hero">
-          <p className="eyebrow">AI DATASET CURATION</p>
+          <p className="eyebrow">CURADORIA DE DATASETS · CROISSANT</p>
 
           <h1>Zenodo Metadata Assistant</h1>
 
@@ -1317,10 +1329,28 @@ function App() {
           </p>
         </header>
 
+        <nav className="workflow" aria-label="Etapas do processo">
+          <div className="workflow-step is-current" aria-current="step">
+            <span className="workflow-number">01</span>
+            <span><strong>Repositório</strong><small>Introduz e analisa</small></span>
+          </div>
+          <span className={`workflow-connector${analysis ? " is-complete" : ""}`} aria-hidden="true" />
+          <div className={`workflow-step${analysis ? " is-current" : ""}${extraction ? " is-complete" : ""}`}>
+            <span className="workflow-number">02</span>
+            <span><strong>Dataset e revisão</strong><small>Escolhe e confirma</small></span>
+          </div>
+          <span className={`workflow-connector${croissant ? " is-complete" : ""}`} aria-hidden="true" />
+          <div className={`workflow-step${croissant ? " is-current" : ""}`}>
+            <span className="workflow-number">03</span>
+            <span><strong>Exportação</strong><small>Gera o Croissant</small></span>
+          </div>
+        </nav>
+
         {/* OLLAMA STATUS */}
 
-        <section className="status-panel">
-          <div>
+        <section className="status-panel" aria-label="Estado dos serviços de IA">
+          <div className={ollamaAvailable === false ? "service-offline" : "service-online"}>
+            <span className="service-indicator" aria-hidden="true" />
             <span className="status-label">Ollama</span>
 
             <strong>
@@ -1332,7 +1362,8 @@ function App() {
             </strong>
           </div>
 
-          <div>
+          <div className={modelInstalled === false ? "service-offline" : "service-online"}>
+            <span className="service-indicator" aria-hidden="true" />
             <span className="status-label">{configuredModel}</span>
 
             <strong>
@@ -1347,7 +1378,14 @@ function App() {
 
         {/* REPOSITORY FORM */}
 
-        <section className="panel">
+        <section className="panel repository-panel">
+          <div className="section-heading">
+            <span className="section-icon" aria-hidden="true">↗</span>
+            <div>
+              <p className="eyebrow">COMEÇAR</p>
+              <h2>Analisar um repositório</h2>
+            </div>
+          </div>
           <form onSubmit={analyze}>
             <label htmlFor="repo-url">
               URL do repositório GitHub
@@ -1676,6 +1714,13 @@ function App() {
                 <p className="eyebrow">CROISSANT GENERATION</p>
 
                 <h2>Gerar metadados Croissant</h2>
+
+                {!croissantFormatSupported && (
+                    <p className="message warning" role="status">
+                      A inspeção e as sugestões estão disponíveis para este
+                      formato, mas a geração Croissant aceita atualmente CSV e TSV.
+                    </p>
+                )}
 
                 <p className="hint">
                   O documento só pode ser gerado depois de confirmares os sete

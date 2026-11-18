@@ -1,9 +1,11 @@
 from pathlib import Path
 from typing import Any
+import configparser
 import json
 import re
 import tomllib
 import unicodedata
+import xml.etree.ElementTree as ET
 from datetime import date
 
 import yaml
@@ -101,6 +103,8 @@ def documentation_sources(repository_data: dict) -> list[dict[str, str]]:
 
 
 def _metadata_text(value: Any) -> str | None:
+    if isinstance(value, date):
+        return value.isoformat()
     if isinstance(value, str) and value.strip():
         return value.strip()
     if isinstance(value, list):
@@ -122,6 +126,8 @@ def _metadata_text(value: Any) -> str | None:
             "licenseidentifier",
             "rightsuri",
             "identifier",
+            "creatorname",
+            "fullname",
         }
         for key, item in value.items():
             if _normalized_key(key) not in preferred_keys:
@@ -161,7 +167,55 @@ def _parse_metadata_document(path: str, content: str) -> Any:
         return tomllib.loads(content)
     if suffix in {".json", ".jsonld"}:
         return json.loads(content)
+    if suffix == ".xml":
+        root = ET.fromstring(content)
+        return {_xml_local_name(root.tag): _xml_element_value(root)}
+    if suffix in {".ini", ".cfg"}:
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read_string(content)
+        return {
+            section: dict(parser[section])
+            for section in parser.sections()
+        }
+    if suffix == ".bib":
+        return {
+            key.lower(): value.strip().strip("{}\"")
+            for key, value in re.findall(
+                r"\b(title|author|year|date|abstract|keywords|language|license)\s*=\s*(\{[^{}]*\}|\"[^\"]*\")",
+                content,
+                flags=re.IGNORECASE,
+            )
+        }
     return None
+
+
+def _xml_local_name(tag: str) -> str:
+    """Remove an XML namespace so DataCite and schema.org keys are matchable."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def _xml_element_value(element: ET.Element) -> Any:
+    """Convert XML nodes to a small JSON-like structure for alias matching."""
+    result: dict[str, Any] = {
+        _xml_local_name(key): value
+        for key, value in element.attrib.items()
+    }
+    for child in element:
+        key = _xml_local_name(child.tag)
+        value = _xml_element_value(child)
+        if key in result:
+            if not isinstance(result[key], list):
+                result[key] = [result[key]]
+            result[key].append(value)
+        else:
+            result[key] = value
+
+    text = (element.text or "").strip()
+    if result:
+        if text:
+            result.setdefault("value", text)
+        return result
+    return text
 
 
 def _find_dataset_node(document: Any) -> dict[str, Any] | None:
@@ -188,18 +242,40 @@ def _find_dataset_node(document: Any) -> dict[str, Any] | None:
 
 def extract_structured_document_metadata(
         repository_data: dict,
-) -> dict[str, tuple[Any, str, str]]:
+        *,
+        all_matches: bool = False,
+) -> dict[str, tuple[Any, str, str]] | list[dict[str, Any]]:
     extracted: dict[str, tuple[Any, str, str]] = {}
+    evidence_records: list[dict[str, Any]] = []
 
     field_keys = {
         "title": {"title", "titles", "datasetname", "datatitle"},
         "description": {"description", "descriptions", "abstract", "datasetdescription", "summary"},
         "keywords": {"keywords", "keyword", "subject", "subjects"},
+        "dataset_type": {"datasettype", "typeofdataset"},
+        "machine_learning_task": {
+            "machinelearningtask",
+            "mltask",
+            "predictiontask",
+        },
+        "data_modality": {"datamodality", "modality"},
+        "number_of_records": {
+            "numberofrecords",
+            "recordcount",
+            "rowcount",
+            "numrecords",
+            "numexamples",
+        },
         "date_published": {
             "datepublished",
             "dateissued",
             "datereleased",
             "publicationdate",
+            "publicationyear",
+            "year",
+            "date",
+            "created",
+            "released",
         },
         "language": {"inlanguage", "language", "languages"},
         "creators": {
@@ -219,6 +295,7 @@ def extract_structured_document_metadata(
             "licenses",
             "licenseurl",
             "licenseid",
+            "spdxid",
             "licensename",
             "rights",
             "rightslist",
@@ -234,19 +311,27 @@ def extract_structured_document_metadata(
             ".yml",
             ".toml",
             ".cff",
+            ".xml",
+            ".bib",
+            ".ini",
+            ".cfg",
         }:
             continue
 
         try:
             document = _parse_metadata_document(path, source["content"])
-        except (json.JSONDecodeError, tomllib.TOMLDecodeError, yaml.YAMLError):
+        except (
+            configparser.Error,
+            json.JSONDecodeError,
+            tomllib.TOMLDecodeError,
+            yaml.YAMLError,
+            ET.ParseError,
+        ):
             continue
         if not isinstance(document, (dict, list)):
             continue
 
         for field_name, aliases in field_keys.items():
-            if field_name in extracted:
-                continue
             value = _find_metadata_value(document, aliases)
             if (
                 field_name == "title"
@@ -259,8 +344,22 @@ def extract_structured_document_metadata(
                     if dataset_node
                     else None
                 )
-            if field_name in {"title", "description", "date_published", "license"}:
+            if field_name in {
+                "title",
+                "description",
+                "date_published",
+                "license",
+                "dataset_type",
+                "data_modality",
+            }:
                 value = _metadata_text(value)
+            elif field_name == "number_of_records":
+                text_value = _metadata_text(value)
+                if text_value:
+                    try:
+                        value = int(text_value.replace(",", "").replace("_", ""))
+                    except ValueError:
+                        value = None
             elif field_name == "keywords":
                 if isinstance(value, str):
                     value = [item.strip() for item in re.split(r"[,;]", value) if item.strip()]
@@ -290,7 +389,12 @@ def extract_structured_document_metadata(
                 if isinstance(value, dict):
                     value = [value]
                 elif isinstance(value, str):
-                    value = [{"name": value.strip()}]
+                    creator_names = [
+                        item.strip()
+                        for item in re.split(r"\s+and\s+", value)
+                        if item.strip()
+                    ]
+                    value = [{"name": name} for name in creator_names]
                 elif isinstance(value, list):
                     creators = []
                     for item in value:
@@ -300,6 +404,13 @@ def extract_structured_document_metadata(
                             given = _metadata_text(item.get("given-names") or item.get("givenName"))
                             family = _metadata_text(item.get("family-names") or item.get("familyName"))
                             creator = dict(item)
+                            creator_name = _metadata_text(
+                                item.get("creatorName")
+                                or item.get("creator_name")
+                                or item.get("name")
+                            )
+                            if creator_name and "name" not in creator:
+                                creator["name"] = creator_name
                             if "name" not in creator and (given or family):
                                 creator["name"] = " ".join(part for part in (given, family) if part)
                             orcid = _metadata_text(
@@ -323,13 +434,20 @@ def extract_structured_document_metadata(
                 value = value.isoformat()
 
             if has_value(value):
-                extracted[field_name] = (
+                match = (
                     value,
                     path,
                     f"Valor indicado explicitamente em metadados estruturados de {path}.",
                 )
+                evidence_records.append({
+                    "field": field_name,
+                    "value": value,
+                    "source": path,
+                    "evidence": match[2],
+                })
+                extracted.setdefault(field_name, match)
 
-    return extracted
+    return evidence_records if all_matches else extracted
 
 
 def _readme_title_and_description(
@@ -447,7 +565,10 @@ def apply_deterministic_metadata(
             0.90,
         )
 
-    if readme_description:
+    # A README paragraph usually describes the repository, not the selected
+    # dataset. In dataset mode, let the LLM synthesize a description from the
+    # selected file's evidence instead of promoting repository prose.
+    if readme_description and not dataset_path:
         description, source = readme_description
         set_deterministic_suggestion(
             metadata.description,
@@ -504,14 +625,23 @@ def apply_deterministic_metadata(
         )
 
         file_format = str(dataset.get("format") or Path(dataset_path).suffix).lower()
-        if file_format in {".csv", ".tsv", "csv", "tsv"}:
+        if file_format in {".csv", ".tsv", ".json", ".jsonl", "csv", "tsv", "json", "jsonl"}:
             set_deterministic_suggestion(
                 metadata.dataset_type, "Tabular dataset", "selected_dataset_inspection",
                 "O ficheiro selecionado é CSV/TSV e a inspeção identificou linhas e colunas.", 0.98,
             )
             set_deterministic_suggestion(
                 metadata.data_modality, "Tabular", "selected_dataset_inspection",
-                "A inspeção do ficheiro CSV/TSV identificou uma estrutura tabular.", 0.98,
+                "A inspeção identificou registos estruturados com colunas.", 0.96,
+            )
+        elif file_format in {".txt", "txt"}:
+            set_deterministic_suggestion(
+                metadata.dataset_type, "Text dataset", "selected_dataset_inspection",
+                "O ficheiro selecionado contém registos de texto simples.", 0.92,
+            )
+            set_deterministic_suggestion(
+                metadata.data_modality, "Text", "selected_dataset_inspection",
+                "A inspeção identificou linhas de texto simples.", 0.92,
             )
 
         records = dataset.get("number_of_records")
@@ -542,6 +672,15 @@ async def extract_repository_metadata(
         dataset_inspection: dict | None = None,
 ) -> ExtractedMetadata:
     payload = dict(repository_data)
+    # Parse every downloaded structured metadata file before calling the LLM.
+    # These facts let the model consider values even when source files exceed
+    # its context budget; final deterministic suggestions retain file evidence.
+    payload["structured_metadata_evidence"] = (
+        extract_structured_document_metadata(
+            repository_data,
+            all_matches=True,
+        )
+    )
     if dataset_inspection is not None:
         payload["dataset_inspection"] = dataset_inspection
 
