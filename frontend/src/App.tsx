@@ -145,6 +145,8 @@ type CroissantResult = {
   croissant: Record<string, unknown>;
 };
 
+type ZenodoResult = { id: number; doi?: string | null; url?: string | null };
+
 const REQUIRED_FIELDS: MetadataFieldName[] = [
   "title",
   "description",
@@ -428,6 +430,7 @@ function App() {
       useState<ConfirmationResult | null>(null);
 
   const [croissant, setCroissant] = useState<CroissantResult | null>(null);
+  const [zenodoResult, setZenodoResult] = useState<ZenodoResult | null>(null);
 
   const [error, setError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
@@ -938,6 +941,25 @@ function App() {
     } finally {
       setLoading(false);
     }
+  }
+
+  async function publishCroissant() {
+    if (!croissant) return;
+    setLoading(true); setError(""); setZenodoResult(null);
+    try {
+      const response = await fetch(`${API_URL}/api/v1/zenodo/publish`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          croissant: croissant.croissant, title: extraction?.metadata.title.value || "Dataset",
+          description: extraction?.metadata.description.value || "Dataset with Croissant metadata.",
+          iscte_affiliated: Array.isArray(extraction?.metadata.creators.value) &&
+            extraction.metadata.creators.value.some((creator: CreatorIdentity) => creator.creator_type === "organization" && /iscte/i.test(creator.name)) }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(getErrorMessage(data, "Não foi possível publicar no Zenodo."));
+      setZenodoResult(data as ZenodoResult);
+    } catch (err) { setError(err instanceof Error ? err.message : "Erro inesperado."); }
+    finally { setLoading(false); }
   }
 
   // ==========================================================
@@ -1783,6 +1805,12 @@ function App() {
               >
                 Descarregar croissant.json
               </button>
+
+              <h3>Enviar para o Zenodo</h3>
+              <button type="button" onClick={() => void publishCroissant()} disabled={loading || !croissant.validated}>
+                {loading ? "A publicar..." : "Publicar no Zenodo"}
+              </button>
+              {zenodoResult && <p className="status-found">Depósito publicado (ID {zenodoResult.id}){zenodoResult.doi ? ` · DOI ${zenodoResult.doi}` : ""}. {zenodoResult.url && <a href={zenodoResult.url} target="_blank" rel="noreferrer">Abrir no Zenodo</a>}</p>}
 
               <h3>Pré-visualização JSON-LD</h3>
 
