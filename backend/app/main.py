@@ -11,6 +11,10 @@ from urllib.parse import quote
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
+from dotenv import load_dotenv
+from pydantic import BaseModel
+
+load_dotenv()
 
 from app.github_service import (
     AnalyzeRequest,
@@ -72,6 +76,15 @@ from app.ror_service import (
 class CroissantGenerateRequest(InspectDatasetRequest):
     metadata: ExtractedMetadata
     orcid_session_token: str | None = None
+
+
+
+
+class ZenodoPublishRequest(BaseModel):
+    croissant: dict
+    title: str
+    description: str
+    iscte_affiliated: bool = False
 
 
 # ============================================================
@@ -606,6 +619,72 @@ async def generate_croissant_endpoint(
 # ============================================================
 # ORCID OAUTH
 # ============================================================
+
+@app.post("/api/v1/zenodo/publish")
+async def publish_to_zenodo(request: ZenodoPublishRequest):
+    """Cria e publica um depósito Zenodo contendo croissant.json."""
+    base_url = os.getenv("ZENODO_BASE_URL", "https://sandbox.zenodo.org").strip().rstrip("/")
+    access_token = os.getenv("ZENODO_ACCESS_TOKEN", "").strip()
+    if not access_token:
+        raise HTTPException(status_code=503, detail="Configura ZENODO_ACCESS_TOKEN no backend/.env.")
+    async with httpx.AsyncClient(timeout=60) as client:
+        stage = "obtenção do token OAuth"
+        try:
+            headers = {"Authorization": f"Bearer {access_token}"}
+            stage = "criação do depósito"
+            created = await client.post(
+                f"{base_url}/api/deposit/depositions",
+                headers=headers,
+                json={},
+            )
+            created.raise_for_status()
+            deposition = created.json()
+            deposition_id = deposition["id"]
+            stage = "atualização dos metadados"
+            metadata = {
+                "metadata": {
+                    "title": request.title,
+                    "upload_type": "dataset",
+                    "description": request.description,
+                    "creators": [{"name": "Zenodo Metadata Assistant"}],
+                }
+            }
+            if request.iscte_affiliated:
+                metadata["metadata"]["communities"] = [{"identifier": "iscte_teste"}]
+            updated = await client.put(
+                f"{base_url}/api/deposit/depositions/{deposition_id}",
+                headers=headers,
+                json=metadata,
+            )
+            updated.raise_for_status()
+            stage = "upload do ficheiro croissant.json"
+            uploaded = await client.post(
+                f"{base_url}/api/deposit/depositions/{deposition_id}/files",
+                headers=headers,
+                data={"name": "croissant.json"},
+                files={"file": ("croissant.json", json.dumps(request.croissant, ensure_ascii=False), "application/ld+json")},
+            )
+            uploaded.raise_for_status()
+            stage = "publicação do depósito"
+            published = await client.post(
+                f"{base_url}/api/deposit/depositions/{deposition_id}/actions/publish",
+                headers=headers,
+            )
+            published.raise_for_status()
+            result = published.json()
+            return {"id": result["id"], "doi": result.get("doi"), "url": result.get("links", {}).get("html")}
+        except httpx.HTTPStatusError as exc:
+            detail = f"Falha na {stage} (HTTP {exc.response.status_code})."
+            try:
+                payload = exc.response.json()
+                message = payload.get("message") or payload.get("errors")
+                if message:
+                    detail += f" Resposta Zenodo: {message}"
+            except Exception:
+                pass
+            raise HTTPException(status_code=502, detail=detail) from exc
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            raise HTTPException(status_code=502, detail=f"Falha na {stage}: {type(exc).__name__}.") from exc
 
 @app.get("/api/v1/orcid/validate/{orcid_id}")
 async def validate_orcid_record(
