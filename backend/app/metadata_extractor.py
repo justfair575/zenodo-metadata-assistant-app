@@ -11,14 +11,9 @@ from datetime import date
 import yaml
 
 from app.ollama_service import extract_with_ollama
-from app.metadata_schema import ExtractedMetadata, MetadataField
+from app.metadata_schema import ExtractedMetadata, MetadataField, REQUIRED_FIELDS
 from app.metadata_validation import KNOWN_SPDX_LICENSES, validate_license
 
-
-REQUIRED_FIELDS = [
-    "title", "description", "creators", "license",
-    "date_published", "dataset_type", "data_modality",
-]
 
 FIELD_NAMES = [
     "title", "description", "creators", "license", "date_published",
@@ -27,6 +22,14 @@ FIELD_NAMES = [
 ]
 
 # Tokens explícitos, não palavras genéricas que possam causar falsos positivos.
+# Etiquetas XML que agrupam registos de criadores.
+CREATOR_CONTAINER_KEYS = {
+    "creator",
+    "author",
+    "contributor",
+    "maintainer",
+}
+
 LANGUAGE_NAME_TOKENS = {
     "en": {"english", "eng", "anglais"},
     "pt": {"portuguese", "portugues", "português"},
@@ -387,8 +390,19 @@ def extract_structured_document_metadata(
                     value = None
             elif field_name == "creators":
                 if isinstance(value, dict):
-                    value = [value]
-                elif isinstance(value, str):
+                    nested_creators = next(
+                        (
+                            item
+                            for key, item in value.items()
+                            if _normalized_key(key) in CREATOR_CONTAINER_KEYS
+                        ),
+                        None,
+                    )
+                    value = nested_creators if nested_creators is not None else value
+                    if isinstance(value, dict):
+                        value = [value]
+
+                if isinstance(value, str):
                     creator_names = [
                         item.strip()
                         for item in re.split(r"\s+and\s+", value)

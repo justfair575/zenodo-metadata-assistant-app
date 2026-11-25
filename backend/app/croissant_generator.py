@@ -12,32 +12,9 @@ from app.metadata_schema import (
     CreatorIdentity,
     ExtractedMetadata,
     MetadataField,
+    REQUIRED_FIELDS,
 )
-
-
-REQUIRED_FIELDS = [
-    "title",
-    "description",
-    "creators",
-    "license",
-    "date_published",
-    "dataset_type",
-    "data_modality",
-]
-
-
-def is_empty(value: Any) -> bool:
-
-    if value is None:
-        return True
-
-    if isinstance(value, str):
-        return not value.strip()
-
-    if isinstance(value, (list, dict)):
-        return len(value) == 0
-
-    return False
+from app.metadata_validation import is_empty
 
 
 def get_confirmed_value(

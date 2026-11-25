@@ -39,13 +39,14 @@ from app.metadata_schema import (
     ConfirmedMetadataResponse,
     CreatorIdentity,
     ExtractedMetadata,
+    REQUIRED_FIELDS,
 )
 
 from app.metadata_review import (
     apply_metadata_reviews,
-    verify_orcid_people,
+    verify_creator_identities,
 )
-from app.metadata_validation import validate_metadata_field
+from app.metadata_validation import is_empty, validate_metadata_field
 
 from app.croissant_generator import build_croissant
 
@@ -305,36 +306,14 @@ async def generate_croissant_endpoint(
     # 1. Verificar os sete campos obrigatórios antes de
     #    descarregar o ficheiro do GitHub.
 
-    required_fields = [
-        "title",
-        "description",
-        "creators",
-        "license",
-        "date_published",
-        "dataset_type",
-        "data_modality",
-    ]
-
     pending_fields = []
     field_errors = {}
 
-    for field_name in required_fields:
+    for field_name in REQUIRED_FIELDS:
 
         field = getattr(request.metadata, field_name)
 
-        is_empty_value = (
-                field.value is None
-                or (
-                        isinstance(field.value, str)
-                        and not field.value.strip()
-                )
-                or (
-                        isinstance(field.value, (list, dict))
-                        and len(field.value) == 0
-                )
-        )
-
-        if field.status != "confirmed" or is_empty_value:
+        if field.status != "confirmed" or is_empty(field.value):
             pending_fields.append(field_name)
             continue
 
@@ -388,48 +367,9 @@ async def generate_croissant_endpoint(
     # A confirmação anterior não deve ser contornável por um pedido
     # direto ao endpoint de geração com metadata marcada como confirmed.
 
-    creators_field = request.metadata.creators
-    creators_field.value = await verify_orcid_people(creators_field.value)
-
-    for index, creator in enumerate(creators_field.value, start=1):
-        if creator.creator_type != "organization":
-            continue
-
-        try:
-            verified_organization = await validate_ror_id(
-                creator.ror_id
-            )
-
-        except RORInvalidIDError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "message": "O formato do ROR ID é inválido.",
-                    "creator": index,
-                },
-            ) from exc
-
-        except RORNotFoundError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "message": "O ROR ID não existe no registo oficial.",
-                    "creator": index,
-                    "ror_id": creator.ror_id,
-                },
-            ) from exc
-
-        except RORServiceError as exc:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Não foi possível verificar o ROR na API oficial. "
-                    "Tenta novamente mais tarde."
-                ),
-            ) from exc
-
-        # O nome oficial do registo é a designação canónica no Croissant.
-        creator.name = verified_organization["name"]
+    request.metadata.creators.value = await verify_creator_identities(
+        request.metadata.creators.value
+    )
 
     # 2. Analisar novamente o repositório.
 
