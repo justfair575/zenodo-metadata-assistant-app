@@ -9,6 +9,7 @@ from app.metadata_schema import (
     ConfirmedMetadataResponse,
     CreatorIdentity,
     MetadataField,
+    REQUIRED_FIELDS,
 )
 
 from app.orcid_service import (
@@ -35,17 +36,6 @@ from app.ror_service import (
 # ============================================================
 # CAMPOS OBRIGATÓRIOS
 # ============================================================
-
-REQUIRED_FIELDS = [
-    "title",
-    "description",
-    "creators",
-    "license",
-    "date_published",
-    "dataset_type",
-    "data_modality",
-]
-
 
 # ============================================================
 # CONVERSÃO DE CRIADORES PARA VALIDAÇÃO GERAL
@@ -328,6 +318,15 @@ async def verify_orcid_people(
 
     return creators
 
+async def verify_creator_identities(
+        creators: list[CreatorIdentity],
+) -> list[CreatorIdentity]:
+    """Valida ORCID e ROR e usa os nomes devolvidos pelos registos oficiais."""
+
+    verified_people = await verify_orcid_people(creators)
+    return await _verify_ror_organizations(verified_people)
+
+
 # ============================================================
 # APLICAR REVISÕES
 # ============================================================
@@ -353,11 +352,7 @@ async def apply_metadata_reviews(
         creators_to_verify = _validate_creator_identities(
             creators_field.value
         )
-        creators_to_verify = await verify_orcid_people(
-            creators_to_verify,
-        )
-
-        creators_field.value = await _verify_ror_organizations(
+        creators_field.value = await verify_creator_identities(
             creators_to_verify
         )
 
@@ -495,12 +490,8 @@ async def apply_metadata_reviews(
                     value_to_validate
                 )
             )
-            value_to_validate = await verify_orcid_people(value_to_validate)
-
-            value_to_validate = (
-                await _verify_ror_organizations(
-                    value_to_validate
-                )
+            value_to_validate = await verify_creator_identities(
+                value_to_validate
             )
 
         # ====================================================

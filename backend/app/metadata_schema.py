@@ -10,6 +10,16 @@ from pydantic import (
     model_validator,
 )
 
+# Contrato comum para extração, revisão, validação e geração Croissant.
+REQUIRED_FIELDS = (
+    "title",
+    "description",
+    "creators",
+    "license",
+    "date_published",
+    "dataset_type",
+    "data_modality",
+)
 
 ReviewStatus = Literal[
     "suggested",

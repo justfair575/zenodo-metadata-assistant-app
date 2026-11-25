@@ -6,6 +6,7 @@
       <sourceFolder url="file://$MODULE_DIR$/backend" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
       <excludeFolder url="file://$MODULE_DIR$/backend/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/backend/backend/.venv" />
     </content>
     <orderEntry type="jdk" jdkName="~\Documents\Faculdade\MEI\1º ano\ADS\zenodo-metadata-app\zenodo-metadata-app\.venv" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
